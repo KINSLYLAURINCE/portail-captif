@@ -568,6 +568,68 @@ function PagePaiement({ lang, setLang }) {
       .finally(() => setChargementForfait(false));
   }, [forfaitId]);
 
+  // ── Polling : vérifier le statut du paiement Fapshi ───────────────────
+  useEffect(() => {
+    if ((etapePaiement !== "attente" && etapePaiement !== "lien") || !fapshiRef) return;
+
+    let annule = false;
+    let compteur = 0;
+
+    const verifier = async () => {
+      if (annule) return;
+      try {
+        const deviceId = getDeviceId();
+        const r = await axios.post("/api/paiement/verifier", {
+          reference: fapshiRef,
+          deviceId
+        });
+
+        if (annule) return;
+
+        if (r.data.status === "SUCCESSFUL") {
+          navigate(`/tickets/${r.data.ticket?.code || fapshiRef}`);
+          return;
+        }
+
+        if (r.data.status === "FAILED") {
+          setErreur(r.data.message || "Paiement refusé ou échoué.");
+          setEtapePaiement("echec");
+          return;
+        }
+
+        // PENDING → continuer le polling
+        compteur++;
+        setTentatives(compteur);
+        setSecondesRestantes(Math.max(0, 60 - compteur * 3));
+
+        if (compteur >= MAX_TENTATIVES) {
+          setErreur("Délai d'attente dépassé (60s). Vérifiez votre téléphone et réessayez.");
+          setEtapePaiement("echec");
+          return;
+        }
+
+        // Attendre 3 secondes avant la prochaine vérification
+        setTimeout(verifier, 3000);
+      } catch (err) {
+        if (!annule) {
+          // Erreur réseau temporaire → réessayer une fois
+          compteur++;
+          setTentatives(compteur);
+          if (compteur < MAX_TENTATIVES) {
+            setTimeout(verifier, 5000);
+          } else {
+            setErreur("Erreur de vérification du paiement. Réessayez.");
+            setEtapePaiement("echec");
+          }
+        }
+      }
+    };
+
+    // Première vérification après 5 secondes (laisser le temps à l'utilisateur de confirmer)
+    const timer = setTimeout(verifier, 5000);
+    return () => { annule = true; clearTimeout(timer); };
+  }, [etapePaiement, fapshiRef]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Validation numéro de téléphone
   const validerTelephone = (tel) => {
     const chiffres = tel.replace(/\D/g, "");
@@ -686,68 +748,6 @@ function PagePaiement({ lang, setLang }) {
       setLoading(false);
     }
   };
-
-  // ── Polling : vérifier le statut du paiement Fapshi ───────────────────
-  useEffect(() => {
-    if ((etapePaiement !== "attente" && etapePaiement !== "lien") || !fapshiRef) return;
-
-    let annule = false;
-    let compteur = 0;
-
-    const verifier = async () => {
-      if (annule) return;
-      try {
-        const deviceId = getDeviceId();
-        const r = await axios.post("/api/paiement/verifier", {
-          reference: fapshiRef,
-          deviceId
-        });
-
-        if (annule) return;
-
-        if (r.data.status === "SUCCESSFUL") {
-          navigate(`/tickets/${r.data.ticket?.code || fapshiRef}`);
-          return;
-        }
-
-        if (r.data.status === "FAILED") {
-          setErreur(r.data.message || "Paiement refusé ou échoué.");
-          setEtapePaiement("echec");
-          return;
-        }
-
-        // PENDING → continuer le polling
-        compteur++;
-        setTentatives(compteur);
-        setSecondesRestantes(Math.max(0, 60 - compteur * 3));
-
-        if (compteur >= MAX_TENTATIVES) {
-          setErreur("Délai d'attente dépassé (60s). Vérifiez votre téléphone et réessayez.");
-          setEtapePaiement("echec");
-          return;
-        }
-
-        // Attendre 3 secondes avant la prochaine vérification
-        setTimeout(verifier, 3000);
-      } catch (err) {
-        if (!annule) {
-          // Erreur réseau temporaire → réessayer une fois
-          compteur++;
-          setTentatives(compteur);
-          if (compteur < MAX_TENTATIVES) {
-            setTimeout(verifier, 5000);
-          } else {
-            setErreur("Erreur de vérification du paiement. Réessayez.");
-            setEtapePaiement("echec");
-          }
-        }
-      }
-    };
-
-    // Première vérification après 5 secondes (laisser le temps à l'utilisateur de confirmer)
-    const timer = setTimeout(verifier, 5000);
-    return () => { annule = true; clearTimeout(timer); };
-  }, [etapePaiement, fapshiRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Écran paiement via page de checkout Fapshi (Direct Pay non activé) ─
   if (etapePaiement === "lien") {
