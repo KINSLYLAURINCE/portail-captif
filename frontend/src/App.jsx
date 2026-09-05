@@ -115,8 +115,6 @@ const LANGS = {
     populaire: "⭐ Populaire",
     partager: "📤 Partager",
     dernierTicket: "Reprendre mon dernier ticket",
-    sessionActive: "Session active",
-    tempsRestant: "Temps restant estimé",
     quota: "Quota",
     debit: "Débit",
     duree: "Durée",
@@ -189,8 +187,6 @@ const LANGS = {
     populaire: "⭐ Popular",
     partager: "📤 Share",
     dernierTicket: "Resume my last ticket",
-    sessionActive: "Active session",
-    tempsRestant: "Estimated time remaining",
     quota: "Quota",
     debit: "Speed",
     duree: "Duration",
@@ -1125,137 +1121,6 @@ function PageTicket({ lang, setLang }) {
   );
 }
 
-// ─── Étape session active (restaurée au chargement) ────────────────────────
-function PageSessionActive({ lang, setLang }) {
-  const t = LANGS[lang];
-  const navigate = useNavigate();
-  const [session, setSession] = useState(null);
-  const [chargement, setChargement] = useState(true);
-  const [countdown, setCountdown] = useState(0);
-  const [connecte, setConnecte] = useState(false);
-  const [redirectCount, setRedirectCount] = useState(5);
-
-  // Charger la session courante
-  useEffect(() => {
-    const deviceId = getDeviceId();
-    axios.get(`/api/session?deviceId=${encodeURIComponent(deviceId)}`)
-      .then(r => {
-        if (!r.data.connecte) { navigate("/", { replace: true }); return; }
-        setSession(r.data);
-        setCountdown(r.data.secondesRestantes || 0);
-      })
-      .catch(() => navigate("/", { replace: true }))
-      .finally(() => setChargement(false));
-  }, []);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setCountdown(c => {
-        if (c <= 1) { clearInterval(timer); return 0; }
-        return c - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    if (connecte) {
-      const timer = setInterval(() => {
-        setRedirectCount(c => {
-          if (c <= 1) { clearInterval(timer); window.location.href = "http://www.google.com"; return 0; }
-          return c - 1;
-        });
-      }, 1000);
-      return () => clearInterval(timer);
-    }
-  }, [connecte]);
-
-  const formatTime = (s) => {
-    if (s === null || s === undefined) return "Illimité";
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}h ${m}m ${sec}s`;
-    if (m > 0) return `${m}m ${sec}s`;
-    return `${sec}s`;
-  };
-
-  if (chargement || !session) {
-    return (
-      <div className="portal">
-        <div className="portal-card">
-          <div className="loading-skeleton"><div className="skeleton-card"></div></div>
-        </div>
-      </div>
-    );
-  }
-
-  const handleConnecter = async () => {
-    setConnecte(true);
-  };
-
-  if (connecte) {
-    return (
-      <div className="portal">
-        <NavBar lang={lang} setLang={setLang} />
-        <div className="portal-card">
-          <div className="success-icon-big">✅</div>
-          <h2 className="success-title">{t.connexionReussie}</h2>
-          <div className="session-info-grid">
-            {session.forfait && <div className="session-info-item"><span>📦</span><strong>{session.forfait}</strong></div>}
-            {session.quota && <div className="session-info-item"><span>{t.quota}</span><strong>{session.quota}</strong></div>}
-            {session.debit && <div className="session-info-item"><span>⚡</span><strong>{session.debit}</strong></div>}
-            <div className="session-info-item"><span>⏱️</span><strong>{formatTime(session.secondesRestantes)}</strong></div>
-          </div>
-          <div className="countdown-bar">
-            <div className="countdown-fill" style={{ animationDuration: `${redirectCount}s` }}></div>
-          </div>
-          <p className="countdown-text">{t.connecte} <strong>{redirectCount}</strong>{t.secondes}</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="portal">
-      <NavBar lang={lang} setLang={setLang} />
-      <div className="portal-card">
-        <div className="logo">📶</div>
-        <h1>{t.sessionActive}</h1>
-        <p className="subtitle">{session.forfait}</p>
-
-        <div className="ticket-forfait">
-          <div className="ticket-forfait-nom">{session.forfait}</div>
-          <div className="ticket-forfait-details">
-            {session.quota && <span>📦 {session.quota}</span>}
-            {session.debit && <span>⚡ {session.debit}</span>}
-          </div>
-        </div>
-
-        <div className="ticket-code-box">
-          <div className="ticket-code-label">{t.codeAcces}</div>
-          <div className="ticket-code">{session.ticket}</div>
-        </div>
-
-        {session.secondesRestantes !== null && (
-          <div style={{ textAlign: "center", margin: "1rem 0" }}>
-            <div style={{ fontSize: "1.4rem", fontWeight: 700, color: "#2563eb" }}>
-              ⏱️ {formatTime(session.secondesRestantes)}
-            </div>
-            <div style={{ fontSize: "0.85rem", color: "#888" }}>{t.tempsRestant}</div>
-          </div>
-        )}
-
-        <button className="btn-primary btn-glow" onClick={handleConnecter}>
-          {t.connecterMaintenant}
-        </button>
-        <button className="btn-secondary" onClick={() => navigate("/")}>{t.retour}</button>
-        <footer>© 2026 SMD-CONNECT</footer>
-      </div>
-    </div>
-  );
-}
-
 // ─── Étape Tickets : liste des tickets disponibles (admin) ────────────────
 function PageTickets({ lang, setLang }) {
   const t = LANGS[lang];
@@ -1344,7 +1209,6 @@ function App() {
       <Route path="/forfaits" element={<PageForfaits lang={lang} setLang={changeLang} />} />
       <Route path="/paiement/:forfaitId" element={<PagePaiement lang={lang} setLang={changeLang} />} />
       <Route path="/code" element={<PageCodeExistant lang={lang} setLang={changeLang} />} />
-      <Route path="/session" element={<PageSessionActive lang={lang} setLang={changeLang} />} />
       <Route path="*" element={<PageAccueil lang={lang} setLang={changeLang} />} />
     </Routes>
   );
