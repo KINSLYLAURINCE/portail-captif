@@ -1487,6 +1487,45 @@ app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
     );
 
     if (!result.success) {
+        const msg = result.message || "";
+        const msgLower = msg.toLowerCase();
+
+        // Direct Pay non activé sur le compte Fapshi → fallback vers la page de checkout (initiate-pay)
+        if (msgLower.includes("forbidden request") || msgLower.includes("activate direct pay") || msgLower.includes("direct pay")) {
+            await ajouterLog("paiement", "ℹ️ Direct Pay non activé — fallback vers la page de checkout Fapshi.");
+
+            const lienResult = await fapshi.initierPaiementParLien(
+                forfait.prix,
+                `Forfait Wi-Fi ${forfait.nom} — SMD-CONNECT`,
+                refExterne
+            );
+
+            if (!lienResult.success) {
+                await ajouterLog("paiement", `❌ Échec génération lien Fapshi pour "${forfait.nom}": ${lienResult.message}`);
+                return res.status(502).json({ success: false, message: lienResult.message });
+            }
+
+            paiementsEnCours.set(lienResult.transId, {
+                forfaitId: forfait.id,
+                telephone: telephone.trim(),
+                operateur: operateur || "",
+                appareilId,
+                ip,
+                mode: "lien",
+                dateInitiation: Date.now()
+            });
+
+            await ajouterLog("paiement", `🔗 Lien Fapshi généré — ${forfait.prix} FCFA pour "${forfait.nom}" (transId: ${lienResult.transId})`);
+
+            return res.json({
+                success: true,
+                reference: lienResult.transId,
+                mode: "rendreLien",
+                link: lienResult.link,
+                message: lienResult.message,
+            });
+        }
+
         await ajouterLog("paiement", `❌ Échec initiation paiement Fapshi pour "${forfait.nom}" (${telephone}): ${result.message}`);
         return res.status(502).json({ success: false, message: result.message });
     }
@@ -1497,6 +1536,7 @@ app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
         operateur: operateur || "",
         appareilId,
         ip,
+        mode: "direct",
         dateInitiation: Date.now()
     });
 

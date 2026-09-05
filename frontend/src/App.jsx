@@ -541,6 +541,7 @@ function PagePaiement({ lang, setLang }) {
   // Données Fapshi
   const [fapshiRef, setFapshiRef] = useState(null);
   const [ussdCode, setUssdCode] = useState(null);
+  const [lienPaiement, setLienPaiement] = useState(null);
   const [tentatives, setTentatives] = useState(0);
   const [messageAttente, setMessageAttente] = useState("");
   // Compteur de secondes restantes (60s max)
@@ -640,6 +641,17 @@ function PagePaiement({ lang, setLang }) {
 
       if (r.data.success) {
         setFapshiRef(r.data.reference);
+
+        // Direct Pay non activé → paiement via la page de checkout Fapshi
+        if (r.data.mode === "rendreLien") {
+          setLienPaiement(r.data.link);
+          setTentatives(0);
+          setSecondesRestantes(60);
+          setMessageAttente(r.data.message || "Finalisez le paiement sur la page sécurisée Fapshi.");
+          setEtapePaiement("lien");
+          return;
+        }
+
         setUssdCode(r.data.ussd_code || null);
         setTentatives(0);
         setSecondesRestantes(60);
@@ -677,7 +689,7 @@ function PagePaiement({ lang, setLang }) {
 
   // ── Polling : vérifier le statut du paiement Fapshi ───────────────────
   useEffect(() => {
-    if (etapePaiement !== "attente" || !fapshiRef) return;
+    if ((etapePaiement !== "attente" && etapePaiement !== "lien") || !fapshiRef) return;
 
     let annule = false;
     let compteur = 0;
@@ -737,6 +749,61 @@ function PagePaiement({ lang, setLang }) {
     return () => { annule = true; clearTimeout(timer); };
   }, [etapePaiement, fapshiRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Écran paiement via page de checkout Fapshi (Direct Pay non activé) ─
+  if (etapePaiement === "lien") {
+    const progression = Math.min((tentatives / MAX_TENTATIVES) * 100, 95);
+    return (
+      <div className="portal">
+        <NavBar lang={lang} setLang={setLang} />
+        <div className="portal-card">
+          <StepIndicator etape="paiement" />
+          <div className="paiement-traitement">
+            <div className="traitement-icon" style={{ color: "#10b981" }}>
+              🛡️
+            </div>
+            <h2>Finalisez le paiement</h2>
+            <p style={{ fontSize: "0.95rem", color: "#555", marginBottom: "0.5rem" }}>
+              {messageAttente}
+            </p>
+            <div className="paiement-montant">{forfait.prix.toLocaleString()} FCFA</div>
+
+            {lienPaiement && (
+              <button
+                className="btn-primary btn-glow"
+                style={{ width: "100%", marginBottom: "0.75rem" }}
+                onClick={() => window.open(lienPaiement, "_blank", "noopener")}
+              >
+                🔗 Payer sur la page sécurisée Fapshi
+              </button>
+            )}
+
+            <p style={{ fontSize: "0.85rem", color: "#888", margin: "0.5rem 0 1rem" }}>
+              Une nouvelle fenêtre s'ouvre avec la page de paiement Fapshi (Orange Money / MTN MoMo).
+              Complétez-y le paiement, puis patientez ici : votre ticket sera généré automatiquement.
+            </p>
+
+            {/* Barre de progression */}
+            <div className="progress-bar-wrap">
+              <div className="progress-bar-fill" style={{ width: `${progression}%`, transition: "width 0.5s" }}></div>
+            </div>
+            <p className="progress-label" style={{ fontSize: "0.8rem", color: "#aaa" }}>
+              ⏳ Vérification en cours... {secondesRestantes > 0 ? `(${secondesRestantes}s restantes)` : ""}
+            </p>
+
+            <button
+              className="btn-secondary"
+              style={{ marginTop: "1.5rem" }}
+              onClick={() => { setEtapePaiement("confirmation"); setFapshiRef(null); setUssdCode(null); setLienPaiement(null); }}
+            >
+              ✕ Annuler
+            </button>
+          </div>
+          <footer>© 2026 SMD-CONNECT</footer>
+        </div>
+      </div>
+    );
+  }
+
   // ── Écran d'attente (polling en cours) ────────────────────────────────
   if (etapePaiement === "attente") {
     const op = operateurs.find(o => o.id === operateur);
@@ -780,7 +847,7 @@ function PagePaiement({ lang, setLang }) {
             <button
               className="btn-secondary"
               style={{ marginTop: "1.5rem" }}
-              onClick={() => { setEtapePaiement("confirmation"); setFapshiRef(null); setUssdCode(null); }}
+              onClick={() => { setEtapePaiement("confirmation"); setFapshiRef(null); setUssdCode(null); setLienPaiement(null); }}
             >
               ✕ Annuler
             </button>
@@ -808,7 +875,7 @@ function PagePaiement({ lang, setLang }) {
               <li>Vérifiez que le numéro est correct</li>
             </ul>
           </div>
-          <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setFapshiRef(null); setUssdCode(null); setTentatives(0); setSecondesRestantes(60); }}>
+          <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setFapshiRef(null); setUssdCode(null); setLienPaiement(null); setTentatives(0); setSecondesRestantes(60); }}>
             🔄 Réessayer
           </button>
           <button className="btn-secondary" onClick={() => navigate("/forfaits")}>{t.changerForfait}</button>

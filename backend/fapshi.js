@@ -82,6 +82,49 @@ async function initierPaiement(telephone, montant, description, reference) {
 }
 
 /**
+ * Initier un paiement via la page de checkout Fapshi (initiate-pay)
+ * Utilisé quand Direct Pay n'est pas activé (fallback automatique)
+ */
+async function initierPaiementParLien(montant, description, reference) {
+    try {
+        const payload = {
+            amount: montant,
+            externalId: reference || undefined,
+            message: description || "Achat forfait Wi-Fi SMD-CONNECT",
+            userId: "smd",
+        };
+
+        console.log(`🔗 [Fapshi] Initiation paiement par lien (checkout): ${montant} FCFA`);
+
+        const response = await axios.post(
+            `${FAPSHI_BASE_URL}/initiate-pay`,
+            payload,
+            { headers: headers(), timeout: 30000 }
+        );
+
+        const data = response.data;
+        console.log(`✅ [Fapshi] Lien de paiement généré — transId: ${data.transId}`);
+
+        return {
+            success: true,
+            transId: data.transId,
+            link: data.link,
+            message: data.message || "Lien de paiement généré.",
+            dateInitiated: data.dateInitiated,
+        };
+    } catch (err) {
+        const errData = err.response?.data;
+        const msg =
+            errData?.message ||
+            (typeof errData === "string" ? errData : null) ||
+            err.message ||
+            "Erreur lors de la génération du lien de paiement.";
+        console.error("❌ [Fapshi] Erreur initiate-pay:", msg, errData);
+        return { success: false, message: msg };
+    }
+}
+
+/**
  * Vérifier le statut d'une transaction Fapshi
  */
 async function verifierPaiement(transId) {
@@ -198,6 +241,7 @@ function etatToken() {
 
 module.exports = {
     initierPaiement,
+    initierPaiementParLien,
     verifierPaiement,
     verifierWebhook,
     normaliserTelephone,
