@@ -824,11 +824,18 @@ function Logs({ token }) {
 // ─── Stats ─────────────────────────────────────────────────────────────────
 function Stats({ token }) {
   const [data, setData] = useState(null);
-  useEffect(() => { axios.get("/api/admin/stats", { headers: { Authorization: `Bearer ${token}` } }).then(r => setData(r.data)).catch(() => {}); }, []);
-  if (!data) return <div className="loading">Chargement...</div>;
+  const [erreur, setErreur] = useState("");
+  useEffect(() => {
+    axios.get("/api/admin/stats", { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => setData(r.data))
+      .catch(e => setErreur(e.response?.data?.message || "Impossible de charger les statistiques."));
+  }, []);
 
-  const { query, setQuery, filtered: connexionsFiltrees } = useSearch(data.connexions, ["ticket", "ip", "forfait"]);
+  const { query, setQuery, filtered: connexionsFiltrees } = useSearch(data?.connexions || [], ["ticket", "ip", "forfait"]);
   const { page, setPage, total, paginated } = usePagination(connexionsFiltrees, 8);
+
+  if (erreur) return <div className="loading" style={{ color: "#dc2626" }}>{erreur}</div>;
+  if (!data) return <div className="loading">Chargement...</div>;
 
   const maxC = Math.max(...data.parJour.map(j => j.connexions), 1);
   const colors = ["#2563eb","#16a34a","#ea580c","#7c3aed","#0891b2","#ca8a04"];
@@ -1705,7 +1712,12 @@ function AdminPage() {
   const [connecte, setConnecte] = useState(false);
   const [token, setToken] = useState(() => localStorage.getItem("smd_admin_token") || "");
   const [loginError, setLoginError] = useState("");
-  const [onglet, setOnglet] = useState("dashboard");
+  const [onglet, setOnglet] = useState(() => localStorage.getItem("smd_admin_onglet") || "dashboard");
+
+  const changerOnglet = (id) => {
+    setOnglet(id);
+    localStorage.setItem("smd_admin_onglet", id);
+  };
 
   // Restaurer le token au chargement
   useEffect(() => {
@@ -1733,7 +1745,7 @@ function AdminPage() {
     delete axios.defaults.headers.common["Authorization"];
     setToken("");
     setConnecte(false);
-    setOnglet("dashboard");
+    changerOnglet("dashboard");
   };
 
   const onglets = [
@@ -1781,7 +1793,7 @@ function AdminPage() {
           </div>
           <nav className="sidebar-nav">
             {onglets.map(o => (
-              <button key={o.id} className={`nav-item ${onglet === o.id ? "active" : ""}`} onClick={() => setOnglet(o.id)}>{o.label}</button>
+              <button key={o.id} className={`nav-item ${onglet === o.id ? "active" : ""}`} onClick={() => changerOnglet(o.id)}>{o.label}</button>
             ))}
           </nav>
           <button className="btn-deconnexion sidebar-logout" onClick={handleDeconnexion}><><X size={16} /> Déconnexion</></button>
