@@ -151,6 +151,60 @@ app.get("/api/forfaits", async (req, res) => {
     res.json({ success: true, forfaits: mapRows(rows) });
 });
 
+// ─── Liste publique des tickets disponibles (créés côté admin) ────────────
+app.get("/api/tickets", rateLimit(20, 60000), async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT t.*, f.nom AS forfait_reel, f.duree AS forfait_duree, f.quota AS forfait_quota, f.debit AS forfait_debit
+             FROM tickets t
+             LEFT JOIN forfaits f ON f.id = t.forfait_id
+             WHERE t.statut = 'disponible'
+             ORDER BY t.id DESC
+             LIMIT 200`
+        );
+        const tickets = rows.map(r => ({
+            ...mapRow(r),
+            forfaitNom: r.forfait_reel || r.forfait_nom,
+            forfaitDuree: r.forfait_duree,
+            forfaitQuota: r.forfait_quota,
+            forfaitDebit: r.forfait_debit,
+        }));
+        res.json({ success: true, tickets });
+    } catch (err) {
+        console.error("Erreur liste tickets:", err.message);
+        res.status(500).json({ success: false, message: "Erreur serveur." });
+    }
+});
+
+// ─── Détail public d'un ticket par code ───────────────────────────────────
+app.get("/api/tickets/:code", rateLimit(30, 60000), async (req, res) => {
+    try {
+        const code = req.params.code?.trim().toUpperCase();
+        if (!code) return res.status(400).json({ success: false, message: "Code requis." });
+
+        const { rows } = await pool.query(
+            `SELECT t.*, f.nom AS forfait_reel, f.duree AS forfait_duree, f.quota AS forfait_quota, f.debit AS forfait_debit
+             FROM tickets t
+             LEFT JOIN forfaits f ON f.id = t.forfait_id
+             WHERE t.code = $1`,
+            [code]
+        );
+        if (rows.length === 0) return res.status(404).json({ success: false, message: "Code invalide ou inexistant." });
+        const r = rows[0];
+        const ticket = {
+            ...mapRow(r),
+            forfaitNom: r.forfait_reel || r.forfait_nom,
+            forfaitDuree: r.forfait_duree,
+            forfaitQuota: r.forfait_quota,
+            forfaitDebit: r.forfait_debit,
+        };
+        res.json({ success: true, ticket });
+    } catch (err) {
+        console.error("Erreur détail ticket:", err.message);
+        res.status(500).json({ success: false, message: "Erreur serveur." });
+    }
+});
+
 // ─── Statut de session d'un appareil ─────────────────────────────────────
 app.get("/api/session", async (req, res) => {
     const deviceId = req.query.deviceId;

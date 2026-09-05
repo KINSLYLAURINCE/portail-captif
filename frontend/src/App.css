@@ -16,7 +16,7 @@ body {
   display: flex;
   justify-content: center;
   align-items: center;
-  padding: 20px;
+  padding: 90px 20px 20px;
   background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 60%, #0f172a 100%);
   background-size: 200% 200%;
   animation: gradientShift 8s ease infinite;
@@ -46,6 +46,80 @@ body {
 
 .portal-card.wide {
   max-width: 720px;
+}
+
+/* ══════════════════════════════════════════
+   NAVIGATION SUPÉRIEURE
+═════════════════════════════════════════════ */
+.topnav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.topnav-brand {
+  font-weight: 800;
+  color: #fff;
+  font-size: 1rem;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+}
+
+.topnav-links {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.topnav-link {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #cbd5e1;
+  font-size: 0.83rem;
+  padding: 7px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.topnav-link:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
+
+.topnav-link.active {
+  color: #fff;
+  background: rgba(37, 99, 235, 0.85);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.topnav-lang {
+  display: flex;
+  gap: 4px;
+}
+
+.topnav-lang button {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #cbd5e1;
+  font-size: 0.78rem;
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.topnav-lang button.active { background: #fff; color: #0f172a; border-color: #fff; }
+
+@media (max-width: 560px) {
+  .topnav { flex-wrap: wrap; padding: 10px 14px; }
+  .topnav-link { padding: 6px 9px; font-size: 0.76rem; }
 }
 
 /* ══════════════════════════════════════════
@@ -360,6 +434,25 @@ h1 {
   border-radius: 20px;
   white-space: nowrap;
   box-shadow: 0 2px 8px rgba(245, 158, 11, 0.4);
+}
+
+/* Carte ticket utilisé (non cliquable) */
+.forfait-card.ticket-utilise {
+  opacity: 0.55;
+  cursor: not-allowed;
+  border-color: #94a3b8;
+  background: #f1f5f9;
+}
+
+.forfait-card.ticket-utilise:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: #94a3b8;
+}
+
+.badge-populaire.ticket-utilise-badge {
+  background: linear-gradient(135deg, #64748b, #475569);
+  box-shadow: 0 2px 8px rgba(100, 116, 139, 0.4);
 }
 
 .forfait-nom {

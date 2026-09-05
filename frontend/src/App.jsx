@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useNavigate, useParams, Routes, Route, useLocation } from "react-router-dom";
 import axios from "axios";
 import "./App.css";
 
@@ -147,6 +148,18 @@ const LANGS = {
     connexionReussie: "Connexion réussie",
     besoinAide: "🛟 Besoin d'aide ?",
     contactAssistance: "Contactez notre assistance",
+    titreTickets: "🎫 Tickets disponibles",
+    sousTitreTickets: "Choisissez un ticket pré-payé et connectez-vous",
+    aucunTicket: "Aucun ticket disponible pour le moment.",
+    erreurTickets: "Impossible de charger les tickets.",
+    connecterCeTicket: "🌐 Se connecter avec ce ticket",
+    ticketDejaUtilise: "Ce ticket a déjà été utilisé.",
+    ticketUtilise: "Utilisé",
+    ticketDisponible: "Disponible",
+    navAccueil: "Accueil",
+    navTickets: "Tickets",
+    navForfaits: "Forfaits",
+    navMonCode: "Mon code",
   },
   en: {
     bienvenue: "Welcome to our Wi-Fi network",
@@ -209,16 +222,61 @@ const LANGS = {
     connexionReussie: "Connection successful",
     besoinAide: "🛟 Need help?",
     contactAssistance: "Contact our support",
+    titreTickets: "🎫 Available tickets",
+    sousTitreTickets: "Choose a prepaid ticket and connect",
+    aucunTicket: "No tickets available right now.",
+    erreurTickets: "Unable to load tickets.",
+    connecterCeTicket: "🌐 Connect with this ticket",
+    ticketDejaUtilise: "This ticket has already been used.",
+    ticketUtilise: "Used",
+    ticketDisponible: "Available",
+    navAccueil: "Home",
+    navTickets: "Tickets",
+    navForfaits: "Plans",
+    navMonCode: "My code",
   }
 };
 
-// ─── Étape 1 : Page d'accueil ──────────────────────────────────────────────
-function PageAccueil({ onCommencer, onDejaCode, onDernierTicket, lang, setLang }) {
+// ─── Barre de navigation partagée ──────────────────────────────────────────
+function NavBar({ lang, setLang }) {
+  const navigate = useNavigate();
+  const location = useLocation();
   const t = LANGS[lang];
+  const links = [
+    { path: "/", label: t.navAccueil },
+    { path: "/tickets", label: t.navTickets },
+    { path: "/forfaits", label: t.navForfaits },
+    { path: "/code", label: t.navMonCode },
+  ];
+  return (
+    <nav className="topnav">
+      <div className="topnav-brand" onClick={() => navigate("/")}>SMD-CONNECT</div>
+      <div className="topnav-links">
+        {links.map(l => (
+          <button
+            key={l.path}
+            className={`topnav-link ${location.pathname === l.path ? "active" : ""}`}
+            onClick={() => navigate(l.path)}
+          >{l.label}</button>
+        ))}
+      </div>
+      <div className="topnav-lang">
+        <button className={lang === "fr" ? "active" : ""} onClick={() => setLang("fr")}>FR</button>
+        <button className={lang === "en" ? "active" : ""} onClick={() => setLang("en")}>EN</button>
+      </div>
+    </nav>
+  );
+}
+
+// ─── Étape 1 : Page d'accueil ──────────────────────────────────────────────
+function PageAccueil({ lang, setLang }) {
+  const t = LANGS[lang];
+  const navigate = useNavigate();
   const dernierTicket = recupererDernierTicket();
 
   return (
     <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
       <div className="portal-card">
         <div className="lang-switcher">
           <button className={lang === "fr" ? "active" : ""} onClick={() => setLang("fr")}>FR</button>
@@ -240,20 +298,20 @@ function PageAccueil({ onCommencer, onDejaCode, onDernierTicket, lang, setLang }
           <span className="quality-badge">⚡ Rapide</span>
         </div>
 
-        <button className="btn-primary btn-glow" onClick={onCommencer}>
+        <button className="btn-primary btn-glow" onClick={() => navigate("/forfaits")}>
           {t.acceder}
         </button>
 
         {/* Reprendre dernier ticket */}
         {dernierTicket && (
-          <button className="btn-resume" onClick={onDernierTicket}>
+          <button className="btn-resume" onClick={() => navigate(`/tickets/${dernierTicket.ticket?.code}`)}>
             🔄 {t.dernierTicket} — <strong>{dernierTicket.forfait?.nom}</strong>
           </button>
         )}
 
         <div className="deja-code-section">
           <p className="deja-code-text">{t.dejaCode}</p>
-          <button className="btn-secondary" onClick={onDejaCode}>
+          <button className="btn-secondary" onClick={() => navigate("/code")}>
             {t.utiliserCode}
           </button>
         </div>
@@ -284,8 +342,9 @@ function PageAccueil({ onCommencer, onDejaCode, onDernierTicket, lang, setLang }
 }
 
 // ─── Connexion directe avec code existant ─────────────────────────────────
-function PageCodeExistant({ onRetour, lang }) {
+function PageCodeExistant({ lang, setLang }) {
   const t = LANGS[lang];
+  const navigate = useNavigate();
   const [code, setCode] = useState("");
   const [message, setMessage] = useState("");
   const [messageType, setMessageType] = useState("success");
@@ -342,6 +401,7 @@ function PageCodeExistant({ onRetour, lang }) {
 
   return (
     <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
       <div className="portal-card">
         <div className="logo">🎫</div>
         <h1>{t.connexionRapide}</h1>
@@ -384,7 +444,7 @@ function PageCodeExistant({ onRetour, lang }) {
           </div>
         )}
 
-        <button className="btn-secondary" onClick={onRetour}>{t.retour}</button>
+        <button className="btn-secondary" onClick={() => navigate("/")}>{t.retour}</button>
         <footer>© 2026 SMD-CONNECT</footer>
       </div>
     </div>
@@ -392,8 +452,9 @@ function PageCodeExistant({ onRetour, lang }) {
 }
 
 // ─── Étape 2 : Choix du forfait ────────────────────────────────────────────
-function PageForfaits({ onChoisir, onRetour, lang }) {
+function PageForfaits({ lang, setLang }) {
   const t = LANGS[lang];
+  const navigate = useNavigate();
   const [forfaits, setForfaits] = useState([]);
   const [loading, setLoading] = useState(true);
   const [erreur, setErreur] = useState("");
@@ -412,6 +473,7 @@ function PageForfaits({ onChoisir, onRetour, lang }) {
 
   return (
     <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
       <div className="portal-card wide">
         <StepIndicator etape="forfaits" />
         <div className="logo">ST</div>
@@ -457,10 +519,10 @@ function PageForfaits({ onChoisir, onRetour, lang }) {
           </div>
         )}
 
-        <button className="btn-primary" onClick={() => onChoisir(selection)} disabled={!selection}>
+        <button className="btn-primary" onClick={() => navigate(`/paiement/${selection.id}`)} disabled={!selection}>
           {t.payer}
         </button>
-        <button className="btn-secondary" onClick={onRetour}>{t.retour}</button>
+        <button className="btn-secondary" onClick={() => navigate("/")}>{t.retour}</button>
         <footer>© 2026 SMD-CONNECT</footer>
       </div>
     </div>
@@ -468,8 +530,12 @@ function PageForfaits({ onChoisir, onRetour, lang }) {
 }
 
 // ─── Étape 3 : Paiement Mobile Money (Fapshi) ─────────────────────────────
-function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
+function PagePaiement({ lang, setLang }) {
   const t = LANGS[lang];
+  const navigate = useNavigate();
+  const { forfaitId } = useParams();
+  const [forfait, setForfait] = useState(null);
+  const [chargementForfait, setChargementForfait] = useState(true);
   const [operateur, setOperateur] = useState("");
   const [telephone, setTelephone] = useState("");
   const [loading, setLoading] = useState(false);
@@ -494,11 +560,43 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
 
   const MAX_TENTATIVES = 20; // 20 × 3s = 60s max
 
+  // Charger le forfait depuis l'URL
+  useEffect(() => {
+    axios.get("/api/forfaits")
+      .then(r => {
+        const f = r.data.forfaits.find(x => String(x.id) === String(forfaitId));
+        setForfait(f || null);
+      })
+      .catch(() => setForfait(null))
+      .finally(() => setChargementForfait(false));
+  }, [forfaitId]);
+
   // Validation numéro de téléphone
   const validerTelephone = (tel) => {
     const chiffres = tel.replace(/\D/g, "");
     return chiffres.length >= 8;
   };
+
+  if (chargementForfait) {
+    return (
+      <div className="portal">
+        <div className="portal-card">
+          <div className="loading-skeleton"><div className="skeleton-card"></div></div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!forfait) {
+    return (
+      <div className="portal">
+        <div className="portal-card">
+          <h1>Forfait introuvable</h1>
+          <button className="btn-primary" onClick={() => navigate("/forfaits")}>{t.retour}</button>
+        </div>
+      </div>
+    );
+  }
 
   const handleConfirmer = () => {
     if (!operateur) { setErreur(t.erreurOperateur); return; }
@@ -524,7 +622,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
           operateur,
           deviceId
         });
-        onPaiementValide(r.data.ticket, forfait);
+        navigate(`/tickets/${r.data.ticket?.code}`);
       } catch (err) {
         setErreur(err.response?.data?.message || "Erreur lors du paiement.");
         setEtapePaiement("confirmation");
@@ -567,7 +665,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
             operateur,
             deviceId
           });
-          onPaiementValide(r.data.ticket, forfait);
+          navigate(`/tickets/${r.data.ticket?.code}`);
           return;
         } catch (err2) {
           setErreur(err2.response?.data?.message || "Erreur lors du paiement.");
@@ -600,7 +698,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
         if (annule) return;
 
         if (r.data.status === "SUCCESSFUL") {
-          onPaiementValide(r.data.ticket, r.data.forfait || forfait);
+          navigate(`/tickets/${r.data.ticket?.code || fapshiRef}`);
           return;
         }
 
@@ -649,6 +747,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
     const progression = Math.min((tentatives / MAX_TENTATIVES) * 100, 95);
     return (
       <div className="portal">
+        <NavBar lang={lang} setLang={setLang} />
         <div className="portal-card">
           <StepIndicator etape="paiement" />
           <div className="paiement-traitement">
@@ -716,7 +815,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
           <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setFapshiRef(null); setUssdCode(null); setTentatives(0); setSecondesRestantes(60); }}>
             🔄 Réessayer
           </button>
-          <button className="btn-secondary" onClick={onRetour}>{t.changerForfait}</button>
+          <button className="btn-secondary" onClick={() => navigate("/forfaits")}>{t.changerForfait}</button>
           <footer>© 2026 SMD-CONNECT</footer>
         </div>
       </div>
@@ -777,6 +876,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
   // ── Écran de saisie (choix opérateur + numéro) ─────────────────────────
   return (
     <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
       <div className="portal-card">
         <StepIndicator etape="paiement" />
         <div className="logo">💳</div>
@@ -823,7 +923,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
         >
           {t.continuer}
         </button>
-        <button className="btn-secondary" onClick={onRetour}>{t.changerForfait}</button>
+        <button className="btn-secondary" onClick={() => navigate("/forfaits")}>{t.changerForfait}</button>
         <footer>© 2026 SMD-CONNECT</footer>
       </div>
     </div>
@@ -831,8 +931,13 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
 }
 
 // ─── Étape 4 : Ticket + connexion ─────────────────────────────────────────
-function PageTicket({ ticket, forfait, onRetour, lang }) {
+function PageTicket({ lang, setLang }) {
   const t = LANGS[lang];
+  const navigate = useNavigate();
+  const { code } = useParams();
+  const [ticket, setTicket] = useState(null);
+  const [forfait, setForfait] = useState(null);
+  const [chargement, setChargement] = useState(true);
   const [message, setMessage] = useState("");
   const [messageType, setMessageType] = useState("success");
   const [loading, setLoading] = useState(false);
@@ -841,9 +946,29 @@ function PageTicket({ ticket, forfait, onRetour, lang }) {
   const [copie, setCopie] = useState(false);
   const [forfaitInfo, setForfaitInfo] = useState(null);
 
+  // Charger le ticket depuis la base (par code)
+  useEffect(() => {
+    if (!code) { setChargement(false); return; }
+    axios.get(`/api/tickets/${encodeURIComponent(code)}`)
+      .then(r => {
+        const tk = r.data.ticket;
+        setTicket(tk);
+        setForfait({
+          id: tk.forfaitId,
+          nom: tk.forfaitNom || tk.forfait_nom,
+          prix: tk.prix,
+          duree: tk.forfaitDuree,
+          quota: tk.forfaitQuota,
+          debit: tk.forfaitDebit,
+        });
+      })
+      .catch(() => { setTicket(null); })
+      .finally(() => setChargement(false));
+  }, [code]);
+
   // Sauvegarder le ticket dans le localStorage
   useEffect(() => {
-    sauvegarderTicket(ticket, forfait);
+    if (ticket && forfait) sauvegarderTicket(ticket, forfait);
   }, [ticket, forfait]);
 
   useEffect(() => {
@@ -857,6 +982,28 @@ function PageTicket({ ticket, forfait, onRetour, lang }) {
       return () => clearInterval(timer);
     }
   }, [connecte]);
+
+  if (chargement) {
+    return (
+      <div className="portal">
+        <div className="portal-card">
+          <div className="loading-skeleton"><div className="skeleton-card"></div></div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!ticket || !forfait) {
+    return (
+      <div className="portal">
+        <div className="portal-card">
+          <div className="logo">🎫</div>
+          <h1>{t.ticketDejaUtilise}</h1>
+          <button className="btn-primary" onClick={() => navigate("/tickets")}>{t.retour}</button>
+        </div>
+      </div>
+    );
+  }
 
   const handleCopier = () => {
     navigator.clipboard.writeText(ticket.code).then(() => {
@@ -884,7 +1031,7 @@ function PageTicket({ ticket, forfait, onRetour, lang }) {
     setLoading(true);
     setMessage("");
     try {
-      const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: forfait.id });
+      const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId });
       setForfaitInfo({
         nom: response.data.forfait,
         quota: response.data.quota,
@@ -903,6 +1050,7 @@ function PageTicket({ ticket, forfait, onRetour, lang }) {
 
   return (
     <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
       <div className="portal-card printable">
         <StepIndicator etape="ticket" />
         <div className="logo">🎫</div>
@@ -970,7 +1118,7 @@ function PageTicket({ ticket, forfait, onRetour, lang }) {
         )}
 
         <button className="btn-imprimer no-print" onClick={handleImprimer}>{t.imprimerTicket}</button>
-        <button className="btn-secondary no-print" onClick={onRetour}>{t.choisirAutreForfait}</button>
+        <button className="btn-secondary no-print" onClick={() => navigate("/tickets")}>{t.choisirAutreForfait}</button>
         <footer>© 2026 SMD-CONNECT</footer>
       </div>
     </div>
@@ -978,11 +1126,27 @@ function PageTicket({ ticket, forfait, onRetour, lang }) {
 }
 
 // ─── Étape session active (restaurée au chargement) ────────────────────────
-function PageSessionActive({ session, onRetour, lang }) {
+function PageSessionActive({ lang, setLang }) {
   const t = LANGS[lang];
-  const [countdown, setCountdown] = useState(session.secondesRestantes || 0);
+  const navigate = useNavigate();
+  const [session, setSession] = useState(null);
+  const [chargement, setChargement] = useState(true);
+  const [countdown, setCountdown] = useState(0);
   const [connecte, setConnecte] = useState(false);
   const [redirectCount, setRedirectCount] = useState(5);
+
+  // Charger la session courante
+  useEffect(() => {
+    const deviceId = getDeviceId();
+    axios.get(`/api/session?deviceId=${encodeURIComponent(deviceId)}`)
+      .then(r => {
+        if (!r.data.connecte) { navigate("/", { replace: true }); return; }
+        setSession(r.data);
+        setCountdown(r.data.secondesRestantes || 0);
+      })
+      .catch(() => navigate("/", { replace: true }))
+      .finally(() => setChargement(false));
+  }, []);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -1016,6 +1180,16 @@ function PageSessionActive({ session, onRetour, lang }) {
     return `${sec}s`;
   };
 
+  if (chargement || !session) {
+    return (
+      <div className="portal">
+        <div className="portal-card">
+          <div className="loading-skeleton"><div className="skeleton-card"></div></div>
+        </div>
+      </div>
+    );
+  }
+
   const handleConnecter = async () => {
     setConnecte(true);
   };
@@ -1023,6 +1197,7 @@ function PageSessionActive({ session, onRetour, lang }) {
   if (connecte) {
     return (
       <div className="portal">
+        <NavBar lang={lang} setLang={setLang} />
         <div className="portal-card">
           <div className="success-icon-big">✅</div>
           <h2 className="success-title">{t.connexionReussie}</h2>
@@ -1043,6 +1218,7 @@ function PageSessionActive({ session, onRetour, lang }) {
 
   return (
     <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
       <div className="portal-card">
         <div className="logo">📶</div>
         <h1>{t.sessionActive}</h1>
@@ -1073,7 +1249,76 @@ function PageSessionActive({ session, onRetour, lang }) {
         <button className="btn-primary btn-glow" onClick={handleConnecter}>
           {t.connecterMaintenant}
         </button>
-        <button className="btn-secondary" onClick={onRetour}>{t.retour}</button>
+        <button className="btn-secondary" onClick={() => navigate("/")}>{t.retour}</button>
+        <footer>© 2026 SMD-CONNECT</footer>
+      </div>
+    </div>
+  );
+}
+
+// ─── Étape Tickets : liste des tickets disponibles (admin) ────────────────
+function PageTickets({ lang, setLang }) {
+  const t = LANGS[lang];
+  const navigate = useNavigate();
+  const [tickets, setTickets] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [erreur, setErreur] = useState("");
+
+  const charger = () => {
+    axios.get("/api/tickets")
+      .then(r => { setTickets(r.data.tickets || []); setErreur(""); })
+      .catch(() => setErreur(t.erreurTickets))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { charger(); }, []);
+  // Actualisation automatique toutes les 15s
+  useEffect(() => { const i = setInterval(charger, 15000); return () => clearInterval(i); }, []);
+
+  return (
+    <div className="portal">
+      <NavBar lang={lang} setLang={setLang} />
+      <div className="portal-card wide">
+        <StepIndicator etape="forfaits" />
+        <div className="logo">🎫</div>
+        <h1>{t.titreTickets}</h1>
+        <p className="subtitle">{t.sousTitreTickets}</p>
+
+        {loading && (
+          <div className="loading-skeleton">
+            {[1,2,3].map(i => <div key={i} className="skeleton-card"></div>)}
+          </div>
+        )}
+        {erreur && <div className="message error">{erreur}</div>}
+        {!loading && tickets.length === 0 && <div className="message error">{t.aucunTicket}</div>}
+
+        <div className="forfaits-grid">
+          {tickets.map(tk => {
+            const dispo = tk.statut === "disponible";
+            return (
+              <div
+                key={tk.code}
+                className={`forfait-card ${dispo ? "" : "ticket-utilise"}`}
+                onClick={() => dispo && navigate(`/tickets/${encodeURIComponent(tk.code)}`)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={e => { if (e.key === "Enter" && dispo) navigate(`/tickets/${encodeURIComponent(tk.code)}`); }}
+              >
+                {dispo && <div className="badge-populaire">{t.ticketDisponible}</div>}
+                {!dispo && <div className="badge-populaire ticket-utilise-badge">{t.ticketUtilise}</div>}
+                <div className="forfait-nom">{tk.forfaitNom || "—"}</div>
+                <div className="ticket-code" style={{ fontSize: "1rem" }}>{tk.code}</div>
+                <div className="forfait-prix">{tk.prix.toLocaleString()} <span>FCFA</span></div>
+                <div className="forfait-details">
+                  {tk.forfaitDuree && <span>⏱️ {tk.forfaitDuree}</span>}
+                  {tk.forfaitQuota && <span>📦 {tk.forfaitQuota}</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <button className="btn-secondary" onClick={() => navigate("/")}>{t.retour}</button>
         <footer>© 2026 SMD-CONNECT</footer>
       </div>
     </div>
@@ -1082,64 +1327,27 @@ function PageSessionActive({ session, onRetour, lang }) {
 
 // ─── App principale ────────────────────────────────────────────────────────
 function App() {
-  const [etape, setEtape] = useState("accueil");
-  const [forfaitChoisi, setForfaitChoisi] = useState(null);
-  const [ticketGenere, setTicketGenere] = useState(null);
-  const [sessionData, setSessionData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [lang, setLang] = useState(() => {
+  const [lang, setLangState] = useState(() => {
     const saved = localStorage.getItem("smd_lang");
     if (saved) return saved;
     const nav = navigator.language?.slice(0, 2);
     return nav === "en" ? "en" : "fr";
   });
 
-  useEffect(() => {
-    localStorage.setItem("smd_lang", lang);
-  }, [lang]);
+  const changeLang = (l) => { setLangState(l); localStorage.setItem("smd_lang", l); };
 
-  // Vérifier la session au chargement
-  useEffect(() => {
-    const deviceId = getDeviceId();
-    axios.get(`/api/session?deviceId=${encodeURIComponent(deviceId)}`)
-      .then(r => {
-        if (r.data.connecte) {
-          setSessionData({
-            ticket: r.data.ticket,
-            forfait: r.data.forfait,
-            quota: r.data.quota,
-            debit: r.data.debit,
-            duree: r.data.duree,
-            debut: r.data.debut,
-            secondesRestantes: r.data.secondesRestantes,
-          });
-          setEtape("session-active");
-        }
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
-
-  const handleChoisirForfait = (forfait) => { setForfaitChoisi(forfait); setEtape("paiement"); };
-  const handlePaiementValide = (ticket, forfait) => { setTicketGenere(ticket); setForfaitChoisi(forfait); setEtape("ticket"); };
-
-  const handleDernierTicket = () => {
-    const data = recupererDernierTicket();
-    if (data) {
-      setTicketGenere(data.ticket);
-      setForfaitChoisi(data.forfait);
-      setEtape("ticket");
-    }
-  };
-
-  if (loading) return <div className="portal"><div className="portal-card"><div className="loading-skeleton"><div className="skeleton-card"></div></div></div></div>;
-
-  if (etape === "session-active") return <PageSessionActive session={sessionData} onRetour={() => setEtape("accueil")} lang={lang} />;
-  if (etape === "accueil")        return <PageAccueil onCommencer={() => setEtape("forfaits")} onDejaCode={() => setEtape("code-existant")} onDernierTicket={handleDernierTicket} lang={lang} setLang={setLang} />;
-  if (etape === "code-existant")  return <PageCodeExistant onRetour={() => setEtape("accueil")} lang={lang} />;
-  if (etape === "forfaits")       return <PageForfaits onChoisir={handleChoisirForfait} onRetour={() => setEtape("accueil")} lang={lang} />;
-  if (etape === "paiement")       return <PagePaiement forfait={forfaitChoisi} onPaiementValide={handlePaiementValide} onRetour={() => setEtape("forfaits")} lang={lang} />;
-  if (etape === "ticket")         return <PageTicket ticket={ticketGenere} forfait={forfaitChoisi} onRetour={() => setEtape("forfaits")} lang={lang} />;
+  return (
+    <Routes>
+      <Route path="/" element={<PageAccueil lang={lang} setLang={changeLang} />} />
+      <Route path="/tickets" element={<PageTickets lang={lang} setLang={changeLang} />} />
+      <Route path="/tickets/:code" element={<PageTicket lang={lang} setLang={changeLang} />} />
+      <Route path="/forfaits" element={<PageForfaits lang={lang} setLang={changeLang} />} />
+      <Route path="/paiement/:forfaitId" element={<PagePaiement lang={lang} setLang={changeLang} />} />
+      <Route path="/code" element={<PageCodeExistant lang={lang} setLang={changeLang} />} />
+      <Route path="/session" element={<PageSessionActive lang={lang} setLang={changeLang} />} />
+      <Route path="*" element={<PageAccueil lang={lang} setLang={changeLang} />} />
+    </Routes>
+  );
 }
 
 export default App;

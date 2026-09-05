@@ -55,11 +55,12 @@ function exportCSV(data, filename) {
 function Dashboard({ token }) {
   const [stats, setStats] = useState(null);
   const [lastUpdate, setLastUpdate] = useState(null);
+  const [erreur, setErreur] = useState("");
 
   const charger = () => {
     axios.get("/api/admin/dashboard", { headers: { Authorization: `Bearer ${token}` } })
-      .then(r => { setStats(r.data.stats); setLastUpdate(new Date()); })
-      .catch(() => {});
+      .then(r => { setStats(r.data.stats); setLastUpdate(new Date()); setErreur(""); })
+      .catch((err) => { setErreur(err.response?.status === 401 ? "Session expirée. Déconnectez-vous et reconnectez-vous." : (err.response?.data?.message || "Impossible de contacter le serveur.")); });
   };
 
   useEffect(() => {
@@ -69,6 +70,7 @@ function Dashboard({ token }) {
     return () => clearInterval(interval);
   }, []);
 
+  if (erreur && !stats) return <div className="loading" style={{ color: "#b91c1c" }}>{erreur}</div>;
   if (!stats) return <div className="loading">Chargement...</div>;
 
   return (
