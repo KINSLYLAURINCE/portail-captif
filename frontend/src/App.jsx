@@ -467,7 +467,7 @@ function PageForfaits({ onChoisir, onRetour, lang }) {
   );
 }
 
-// ─── Étape 3 : Paiement Mobile Money (Campay) ─────────────────────────────
+// ─── Étape 3 : Paiement Mobile Money (Fapshi) ─────────────────────────────
 function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
   const t = LANGS[lang];
   const [operateur, setOperateur] = useState("");
@@ -476,15 +476,15 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
   const [erreur, setErreur] = useState("");
   // etapePaiement: "saisie" | "confirmation" | "attente" | "echec"
   const [etapePaiement, setEtapePaiement] = useState("saisie");
-  // Données Campay
-  const [campayRef, setCampayRef] = useState(null);
+  // Données Fapshi
+  const [fapshiRef, setFapshiRef] = useState(null);
   const [ussdCode, setUssdCode] = useState(null);
   const [tentatives, setTentatives] = useState(0);
   const [messageAttente, setMessageAttente] = useState("");
   // Compteur de secondes restantes (60s max)
   const [secondesRestantes, setSecondesRestantes] = useState(60);
 
-  // Opérateurs supportés par Campay (Orange Money + MTN MoMo)
+  // Opérateurs supportés par Fapshi (Orange Money + MTN MoMo)
   const operateurs = [
     { id: "orange", nom: "Orange Money", emoji: "🟠", couleur: "#ff6600", campay: true },
     { id: "mtn",    nom: "MTN MoMo",     emoji: "🟡", couleur: "#ffcc00", campay: true },
@@ -507,14 +507,14 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
     setEtapePaiement("confirmation");
   };
 
-  // ── Lancer le paiement Campay ──────────────────────────────────────────
+  // ── Lancer le paiement Fapshi ──────────────────────────────────────────
   const handlePayer = async () => {
     setLoading(true);
     setErreur("");
 
     const op = operateurs.find(o => o.id === operateur);
 
-    // Si opérateur non supporté par Campay → fallback vers l'ancienne route /api/acheter
+    // Si opérateur non supporté par Fapshi → fallback vers l'ancienne route /api/acheter
     if (!op?.campay) {
       try {
         const deviceId = getDeviceId();
@@ -534,7 +534,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
       return;
     }
 
-    // ── Paiement via Campay (Orange Money / MTN MoMo) ──────────────────
+    // ── Paiement via Fapshi (Orange Money / MTN MoMo) ──────────────────
     try {
       const deviceId = getDeviceId();
       const r = await axios.post("/api/paiement/initier", {
@@ -545,7 +545,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
       });
 
       if (r.data.success) {
-        setCampayRef(r.data.reference);
+        setFapshiRef(r.data.reference);
         setUssdCode(r.data.ussd_code || null);
         setTentatives(0);
         setSecondesRestantes(60);
@@ -557,8 +557,8 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
       }
     } catch (err) {
       const msg = err.response?.data?.message || "Impossible de contacter le serveur de paiement.";
-      // Si Campay non configuré → fallback vers /api/acheter
-      if (err.response?.data?.campayManquant) {
+      // Si Fapshi non configuré → fallback vers /api/acheter
+      if (err.response?.data?.fapshiManquant) {
         try {
           const deviceId = getDeviceId();
           const r = await axios.post("/api/acheter", {
@@ -581,9 +581,9 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
     }
   };
 
-  // ── Polling : vérifier le statut du paiement Campay ───────────────────
+  // ── Polling : vérifier le statut du paiement Fapshi ───────────────────
   useEffect(() => {
-    if (etapePaiement !== "attente" || !campayRef) return;
+    if (etapePaiement !== "attente" || !fapshiRef) return;
 
     let annule = false;
     let compteur = 0;
@@ -593,7 +593,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
       try {
         const deviceId = getDeviceId();
         const r = await axios.post("/api/paiement/verifier", {
-          reference: campayRef,
+          reference: fapshiRef,
           deviceId
         });
 
@@ -641,7 +641,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
     // Première vérification après 5 secondes (laisser le temps à l'utilisateur de confirmer)
     const timer = setTimeout(verifier, 5000);
     return () => { annule = true; clearTimeout(timer); };
-  }, [etapePaiement, campayRef]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [etapePaiement, fapshiRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Écran d'attente (polling en cours) ────────────────────────────────
   if (etapePaiement === "attente") {
@@ -685,7 +685,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
             <button
               className="btn-secondary"
               style={{ marginTop: "1.5rem" }}
-              onClick={() => { setEtapePaiement("confirmation"); setCampayRef(null); setUssdCode(null); }}
+              onClick={() => { setEtapePaiement("confirmation"); setFapshiRef(null); setUssdCode(null); }}
             >
               ✕ Annuler
             </button>
@@ -713,7 +713,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
               <li>Vérifiez que le numéro est correct</li>
             </ul>
           </div>
-          <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setCampayRef(null); setUssdCode(null); setTentatives(0); setSecondesRestantes(60); }}>
+          <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setFapshiRef(null); setUssdCode(null); setTentatives(0); setSecondesRestantes(60); }}>
             🔄 Réessayer
           </button>
           <button className="btn-secondary" onClick={onRetour}>{t.changerForfait}</button>
@@ -796,7 +796,7 @@ function PagePaiement({ forfait, onPaiementValide, onRetour, lang }) {
             >
               <div className="operateur-emoji">{op.emoji}</div>
               <div className="operateur-nom">{op.nom}</div>
-              {op.campay && <div className="operateur-badge">✅ Campay</div>}
+              {op.campay && <div className="operateur-badge">✅ Mobile Money</div>}
               {operateur === op.id && <div className="forfait-check" style={{ background: op.couleur }}>✓</div>}
             </div>
           ))}

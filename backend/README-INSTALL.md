@@ -1,7 +1,7 @@
 # SMD-CONNECT — Portail Captif Wi-Fi
 
 > Backend Express + PostgreSQL pour gestion de portail captif avec tickets Wi-Fi,
-> paiement Mobile Money (Campay) et intégration Mikrotik RouterOS.
+> paiement Mobile Money (Fapshi) et intégration Mikrotik RouterOS.
 
 ---
 
@@ -21,7 +21,7 @@ Il a été migré vers une base de données **PostgreSQL** (`portail_captif`) :
 
 ### Données migrées depuis data.json
 - ✅ 7 forfaits (IDs 5–11 conservés)
-- ✅ 5 tickets (dont 1 paiement Campay réel : ref `29e3dcc3-7c20-...`)
+- ✅ 5 tickets (dont 1 paiement Fapshi réel : ref `29e3dcc3-7c20-...`)
 - ✅ 5 connexions (recette historique : **2 550 FCFA**)
 - ✅ 51 logs
 - ✅ Paramètres (nom réseau, couleur, email admin)
@@ -43,8 +43,8 @@ portail-captif/
 │   ├── seed.js        ← Restauration data.json → PostgreSQL (réutilisable)
 │   ├── schema.sql     ← DDL complet (référence, exécutable via psql)
 │   ├── mikrotik.js    ← Client TCP natif API RouterOS (port 8728)
-│   ├── campay.js      ← Passerelle Mobile Money Orange/MTN
-│   ├── .env           ← Configuration (DB, admin, mikrotik, campay)
+│   ├── fapshi.js      ← Passerelle Mobile Money Orange/MTN (Fapshi)
+│   ├── .env           ← Configuration (DB, admin, mikrotik, fapshi)
 │   └── data.json      ← BACKUP uniquement (plus lu par le serveur)
 └── frontend/          ← React + Vite (portail client + interface admin)
 ```
@@ -138,10 +138,10 @@ MIKROTIK_PORT=8728
 MIKROTIK_USER=admin
 MIKROTIK_PASSWORD=
 
-CAMPAY_BASE_URL=https://demo.campay.net/api   # https://campay.net/api en prod
-CAMPAY_APP_USERNAME=***
-CAMPAY_APP_PASSWORD=***
-CAMPAY_WEBHOOK_URL=                # URL publique HTTPS du webhook
+FAPSHI_API_USER=***
+FAPSHI_API_KEY=***
+FAPSHI_WEBHOOK_SECRET=              # Secret configuré dans le dashboard Fapshi
+FAPSHI_WEBHOOK_URL=                # URL publique HTTPS du webhook
 ```
 
 ---
@@ -157,15 +157,15 @@ CAMPAY_WEBHOOK_URL=                # URL publique HTTPS du webhook
 | POST | `/api/acces-gratuit` | Forfait gratuit (1× par appareil) |
 | POST | `/api/acheter` | Générer un ticket |
 | POST | `/api/login-code` | Connexion avec un code |
-| POST | `/api/paiement/initier` | Initier paiement Campay |
+| POST | `/api/paiement/initier` | Initier paiement Fapshi |
 | POST | `/api/paiement/verifier` | Polling statut paiement |
-| POST | `/api/paiement/webhook` | Callback Campay |
+| POST | `/api/paiement/webhook` | Callback Fapshi |
 
 ### Admin (header `password: <ADMIN_PASSWORD>`)
 Dashboard, CRUD forfaits/tickets/hotspots/domiciles/blacklist/logs/paramètres,
 stats, comptabilité, comptes privilégiés (bypass MAC), outils Mikrotik
-(`/api/admin/mikrotik/sync-tickets`, `sync-forfaits`, `test`), outils Campay
-(`/api/admin/campay/statut`, `paiements`, `forcer-verification/:ref`).
+(`/api/admin/mikrotik/sync-tickets`, `sync-forfaits`, `test`), outils Fapshi
+(`/api/admin/fapshi/statut`, `paiements`, `forcer-verification/:ref`).
 
 ---
 
@@ -177,8 +177,8 @@ stats, comptabilité, comptes privilégiés (bypass MAC), outils Mikrotik
    - `.env` → `MIKROTIK_ENABLED=true` + identifiants
    - Synchroniser les tickets : `POST /api/admin/mikrotik/sync-tickets`
 
-2. **Campay production** : compte réel sur campay.net,
-   `CAMPAY_BASE_URL=https://campay.net/api`, webhook HTTPS public configuré.
+2. **Fapshi production** : compte activé sur fapshi.com,
+   clés API live (`FAK_*`), webhook HTTPS public configuré dans le dashboard Fapshi.
 
 3. **Sécurité** : changer `ADMIN_PASSWORD`, restreindre l'accès PG (hôte/mot de passe fort).
 

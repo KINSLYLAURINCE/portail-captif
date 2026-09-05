@@ -891,45 +891,305 @@ function Stats({ token }) {
   );
 }
 
-// ─── Comptabilité ──────────────────────────────────────────────────────────
-function Comptabilite({ token }) {
+// ─── Finances — Gestion d'Argent ───────────────────────────────────────────
+function Finances({ token }) {
   const [data, setData] = useState(null);
-  useEffect(() => { axios.get("/api/admin/comptabilite", { headers: { Authorization: `Bearer ${token}` } }).then(r => setData(r.data)).catch(() => {}); }, []);
+  const [filtres, setFiltres] = useState({ from: "", to: "", forfaitId: "", gratuit: "" });
+  const [forfaits, setForfaits] = useState([]);
+  const [msg, setMsg] = useState({ text: "", type: "" });
+  const [loading, setLoading] = useState(false);
+
+  const showMsg = (text, type = "success") => { setMsg({ text, type }); setTimeout(() => setMsg({ text: "", type: "" }), 3000); };
+
+  const charger = async (f = filtres) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (f.from) params.set("from", f.from);
+      if (f.to) params.set("to", f.to);
+      if (f.forfaitId) params.set("forfaitId", f.forfaitId);
+      if (f.gratuit !== "") params.set("gratuit", f.gratuit);
+      const qs = params.toString();
+      const r = await axios.get(`/api/admin/finances${qs ? `?${qs}` : ""}`, { headers: { Authorization: `Bearer ${token}` } });
+      setData(r.data);
+    } catch (err) { showMsg(err.response?.data?.message || "Erreur chargement finances.", "error"); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => {
+    axios.get("/api/admin/forfaits", { headers: { Authorization: `Bearer ${token}` } }).then(r => setForfaits(r.data.forfaits)).catch(() => {});
+    charger();
+  }, []);
+
+  const handleFiltre = (e) => {
+    e.preventDefault();
+    charger(filtres);
+  };
+
+  const resetFiltres = () => {
+    const empty = { from: "", to: "", forfaitId: "", gratuit: "" };
+    setFiltres(empty);
+    charger(empty);
+  };
+
+  const exporterCSV = () => {
+    if (!data?.tickets?.length) { showMsg("Aucune donnée à exporter.", "error"); return; }
+    const headers = ["Code", "Forfait", "Prix (FCFA)", "Type", "Statut", "Téléphone", "Opérateur", "Référence", "Date"];
+    const rows = data.tickets.map(t => [
+      t.code, t.forfait_nom, t.prix,
+      t.gratuit ? "Gratuit" : "Payant",
+      t.statut, t.telephone || "", t.operateur || "", t.campay_reference || "",
+      t.date_creation ? new Date(t.date_creation).toLocaleString("fr-FR") : ""
+    ]);
+    const csv = [headers, ...rows].map(r => r.map(v => `"${String(v || "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = "finances-smd-connect.csv"; a.click();
+    URL.revokeObjectURL(url);
+  };
+
   if (!data) return <div className="loading">Chargement...</div>;
+  const t = data.totaux;
+
   return (
     <div className="tab-content">
-      <h2 className="section-title"><><DollarSign size={20} /> Comptabilité</></h2>
+      <h2 className="section-title">
+        <><DollarSign size={20} /> Gestion d'Argent</>
+        <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "normal", marginLeft: "12px" }}>
+          <><RefreshCw size={12} /> {data.tickets.length} tickets · {new Date().toLocaleTimeString("fr-FR")}</>
+        </span>
+      </h2>
+
+      {msg.text && <div className={`feedback ${msg.type}`}>{msg.text}</div>}
+
+      {/* ── Cartes de synthèse ── */}
       <div className="stats-grid">
-        <div className="stat-card green"><div className="stat-icon"><DollarSign size={24} /></div><div className="stat-info"><div className="stat-value">{data.recetteAujourdhui.toLocaleString()} F</div><div className="stat-label">Recette Aujourd'hui</div></div></div>
-        <div className="stat-card blue"><div className="stat-icon"><BarChart3 size={24} /></div><div className="stat-info"><div className="stat-value">{data.recetteTotal.toLocaleString()} F</div><div className="stat-label">Recette Totale</div></div></div>
+        <div className="stat-card green">
+          <div className="stat-icon"><DollarSign size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.recette_payante?.toLocaleString() ?? 0} F</div>
+            <div className="stat-label">Recette Payante (tickets)</div>
+          </div>
+        </div>
+        <div className="stat-card blue">
+          <div className="stat-icon"><BarChart3 size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.recetteReelle?.toLocaleString() ?? 0} F</div>
+            <div className="stat-label">Recette Réelle (connexions)</div>
+          </div>
+        </div>
+        <div className="stat-card yellow">
+          <div className="stat-icon"><Ticket size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.total_tickets ?? 0}</div>
+            <div className="stat-label">Tickets vendus</div>
+          </div>
+        </div>
+        <div className="stat-card purple">
+          <div className="stat-icon"><Check size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.tickets_payants ?? 0}</div>
+            <div className="stat-label">Tickets payants</div>
+          </div>
+        </div>
+        <div className="stat-card teal">
+          <div className="stat-icon"><Zap size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.tickets_gratuits ?? 0}</div>
+            <div className="stat-label">Tickets gratuits</div>
+          </div>
+        </div>
+        <div className="stat-card orange">
+          <div className="stat-icon"><Users size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.tickets_utilises ?? 0}</div>
+            <div className="stat-label">Tickets utilisés</div>
+          </div>
+        </div>
+        <div className="stat-card red">
+          <div className="stat-icon"><AlertTriangle size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.tickets_disponibles ?? 0}</div>
+            <div className="stat-label">Tickets non utilisés</div>
+          </div>
+        </div>
+        <div className="stat-card dark">
+          <div className="stat-icon"><Clock size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{(t.recette_gratuite ?? 0).toLocaleString()} F</div>
+            <div className="stat-label">Valeur gratuits (0 norm.)</div>
+          </div>
+        </div>
       </div>
+
+      {/* ── Filtres ── */}
       <div className="admin-section">
-        <h3><><Clock size={16} /> Recettes par mois</></h3>
-        {Object.keys(data.parMois).length === 0 ? <p className="empty-msg">Aucune donnée.</p> : (
-          <div className="table-wrapper"><table><thead><tr><th>Mois</th><th>Recette</th></tr></thead>
-            <tbody>{Object.entries(data.parMois).sort((a, b) => b[0].localeCompare(a[0])).map(([mois, montant]) => (
-              <tr key={mois}><td>{new Date(mois + "-01").toLocaleDateString("fr-FR", { month: "long", year: "numeric" })}</td><td><span className="badge green">{montant.toLocaleString()} FCFA</span></td></tr>
+        <div className="section-header">
+          <h3><><Search size={16} /> Filtres</></h3>
+          <button className="btn-export" onClick={resetFiltres}><><X size={14} /> Réinitialiser</></button>
+        </div>
+        <form onSubmit={handleFiltre} style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div className="form-group">
+            <label>Du</label>
+            <input type="date" value={filtres.from} onChange={e => setFiltres({ ...filtres, from: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Au</label>
+            <input type="date" value={filtres.to} onChange={e => setFiltres({ ...filtres, to: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Forfait</label>
+            <select value={filtres.forfaitId} onChange={e => setFiltres({ ...filtres, forfaitId: e.target.value })}>
+              <option value="">Tous</option>
+              {forfaits.map(f => <option key={f.id} value={f.id}>{f.nom}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Type</label>
+            <select value={filtres.gratuit} onChange={e => setFiltres({ ...filtres, gratuit: e.target.value })}>
+              <option value="">Tous</option>
+              <option value="0">Payants</option>
+              <option value="1">Gratuits</option>
+            </select>
+          </div>
+          <div className="form-group form-btn">
+            <button type="submit" disabled={loading}>{loading ? "..." : <><Search size={14} /> Filtrer</>}</button>
+          </div>
+          <div className="form-group form-btn">
+            <button type="button" className="btn-export" onClick={exporterCSV}><><Download size={14} /> CSV</></button>
+          </div>
+        </form>
+      </div>
+
+      {/* ── Recettes par jour ── */}
+      <div className="admin-section">
+        <h3><><Clock size={16} /> Recettes par jour ({data.parJour.length})</></h3>
+        {data.parJour.length === 0 ? <p className="empty-msg">Aucune donnée.</p> : (
+          <div className="table-wrapper"><table>
+            <thead><tr><th>Date</th><th>Tickets</th><th>Recette</th></tr></thead>
+            <tbody>{data.parJour.map((d, i) => (
+              <tr key={i}>
+                <td>{new Date(d.jour + "T00:00:00").toLocaleDateString("fr-FR", { weekday: "short", day: "2-digit", month: "short", year: "numeric" })}</td>
+                <td><span className="badge blue">{d.tickets}</span></td>
+                <td><span className="badge green">{(d.recette || 0).toLocaleString()} FCFA</span></td>
+              </tr>
             ))}</tbody>
           </table></div>
         )}
       </div>
+
+      {/* ── Recettes par forfait ── */}
       <div className="admin-section">
         <h3><><Package size={16} /> Recettes par forfait</></h3>
-        {Object.keys(data.parForfait).length === 0 ? <p className="empty-msg">Aucune donnée.</p> : (
-          <div className="duree-grid">{Object.entries(data.parForfait).map(([nom, montant]) => <div key={nom} className="duree-card"><div className="duree-count">{montant.toLocaleString()} F</div><div className="duree-label">{nom}</div></div>)}</div>
+        {data.parForfait.length === 0 ? <p className="empty-msg">Aucune donnée.</p> : (
+          <div className="table-wrapper"><table>
+            <thead><tr><th>Forfait</th><th>Tickets</th><th>Recette</th></tr></thead>
+            <tbody>{data.parForfait.map((f, i) => (
+              <tr key={i}>
+                <td><span className="badge blue">{f.forfait}</span></td>
+                <td>{f.tickets}</td>
+                <td><span className="badge green">{(f.recette || 0).toLocaleString()} FCFA</span></td>
+              </tr>
+            ))}</tbody>
+          </table></div>
         )}
       </div>
+
+      {/* ── Recettes par opérateur ── */}
+      {data.parOperateur.length > 0 && (
+        <div className="admin-section">
+          <h3><><Users size={16} /> Recettes par opérateur / mode de paiement</></h3>
+          <div className="table-wrapper"><table>
+            <thead><tr><th>Mode</th><th>Tickets</th><th>Recette</th></tr></thead>
+            <tbody>{data.parOperateur.map((o, i) => (
+              <tr key={i}>
+                <td><span className={`badge ${o.operateur === "Orange Money" ? "orange" : o.operateur === "MTN MoMo" ? "yellow" : "dark"}`}>{o.operateur}</span></td>
+                <td>{o.tickets}</td>
+                <td><span className="badge green">{(o.recette || 0).toLocaleString()} FCFA</span></td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        </div>
+      )}
+
+      {/* ── Détail de chaque ticket ── */}
       <div className="admin-section">
-        <h3>Transactions récentes</h3>
-        <div className="table-wrapper"><table>
-          <thead><tr><th>#</th><th>Ticket</th><th>Forfait</th><th>Date</th><th>Montant</th></tr></thead>
-          <tbody>{data.transactions.length === 0 ? <tr><td colSpan="5" className="empty-msg">Aucune transaction.</td></tr> : data.transactions.map(t => (
-            <tr key={t.id}><td>{t.id}</td><td className="code-cell">{t.ticket}</td><td>{t.forfait || "—"}</td>
-              <td>{t.date ? new Date(t.date).toLocaleString("fr-FR") : "—"}</td>
-              <td><span className="badge green">{(t.montant || 0).toLocaleString()} FCFA</span></td>
-            </tr>
-          ))}</tbody>
-        </table></div>
+        <div className="section-header">
+          <h3><><List size={16} /> Détail des tickets et de l'argent généré ({data.tickets.length})</></h3>
+        </div>
+        <div className="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Code Ticket</th>
+                <th>Forfait</th>
+                <th>Prix</th>
+                <th>Type</th>
+                <th>Statut</th>
+                <th>Téléphone</th>
+                <th>Opérateur</th>
+                <th>Référence Paiement</th>
+                <th>Date achat</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.tickets.length === 0 ? (
+                <tr><td colSpan="9" className="empty-msg">Aucun ticket trouvé.</td></tr>
+              ) : data.tickets.map((tk, i) => (
+                <tr key={i}>
+                  <td className="code-cell">{tk.code}</td>
+                  <td><span className="badge blue">{tk.forfait_nom || "—"}</span></td>
+                  <td><span className="badge green">{(tk.prix || 0).toLocaleString()} FCFA</span></td>
+                  <td>
+                    <span className={`badge ${tk.gratuit ? "teal" : "orange"}`}>
+                      {tk.gratuit ? "Gratuit" : "Payant"}
+                    </span>
+                  </td>
+                  <td>
+                    <span className={`badge ${tk.statut === "disponible" ? "actif" : tk.statut === "utilise" ? "orange" : "inactif"}`}>
+                      {tk.statut === "disponible" ? "Disponible" : tk.statut === "utilise" ? "Utilisé" : tk.statut}
+                    </span>
+                  </td>
+                  <td>{tk.telephone || "—"}</td>
+                  <td>{tk.operateur || "—"}</td>
+                  <td style={{ fontSize: "11px", fontFamily: "monospace", color: "#64748b" }}>{tk.campay_reference || "—"}</td>
+                  <td style={{ fontSize: "12px", whiteSpace: "nowrap" }}>
+                    {tk.date_creation ? new Date(tk.date_creation).toLocaleString("fr-FR") : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── Connexions facturées ── */}
+      <div className="admin-section">
+        <div className="section-header">
+          <h3><><CircleDot size={16} /> Connexions facturées (source de recette réelle) ({data.connexions.length})</></h3>
+        </div>
+        <div className="table-wrapper">
+          <table>
+            <thead>
+              <tr><th>#</th><th>Ticket</th><th>IP</th><th>Forfait</th><th>Début</th><th>Fin</th><th>Montant</th></tr>
+            </thead>
+            <tbody>
+              {data.connexions.length === 0 ? (
+                <tr><td colSpan="7" className="empty-msg">Aucune connexion enregistrée.</td></tr>
+              ) : data.connexions.map(c => (
+                <tr key={c.id}>
+                  <td>{c.id}</td>
+                  <td className="code-cell">{c.ticket || "—"}</td>
+                  <td>{c.ip || "—"}</td>
+                  <td><span className="badge blue">{c.forfait || "—"}</span></td>
+                  <td style={{ fontSize: "12px" }}>{c.debut ? new Date(c.debut).toLocaleString("fr-FR") : "—"}</td>
+                  <td style={{ fontSize: "12px" }}>{c.fin ? new Date(c.fin).toLocaleString("fr-FR") : "En cours"}</td>
+                  <td><span className="badge green">{(c.montant || 0).toLocaleString()} FCFA</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -1169,8 +1429,8 @@ function Mikrotik({ token }) {
   );
 }
 
-// ─── Campay — Paiements Mobile Money ──────────────────────────────────────
-function CampayPaiements({ token }) {
+// ─── Fapshi — Paiements Mobile Money ──────────────────────────────────────
+function FapshiPaiements({ token }) {
   const [statut, setStatut] = useState(null);
   const [paiements, setPaiements] = useState(null);
   const [msg, setMsg] = useState({ text: "", type: "" });
@@ -1185,15 +1445,15 @@ function CampayPaiements({ token }) {
   const chargerStatut = async () => {
     setLoadingStatut(true);
     try {
-      const r = await axios.get("/api/admin/campay/statut", { headers: { Authorization: `Bearer ${token}` } });
+      const r = await axios.get("/api/admin/fapshi/statut", { headers: { Authorization: `Bearer ${token}` } });
       setStatut(r.data);
-    } catch { showMsg("Erreur chargement statut Campay.", "error"); }
+    } catch { showMsg("Erreur chargement statut Fapshi.", "error"); }
     finally { setLoadingStatut(false); }
   };
 
   const chargerPaiements = async () => {
     try {
-      const r = await axios.get("/api/admin/campay/paiements", { headers: { Authorization: `Bearer ${token}` } });
+      const r = await axios.get("/api/admin/fapshi/paiements", { headers: { Authorization: `Bearer ${token}` } });
       setPaiements(r.data);
     } catch { showMsg("Erreur chargement paiements.", "error"); }
   };
@@ -1201,7 +1461,6 @@ function CampayPaiements({ token }) {
   useEffect(() => {
     chargerStatut();
     chargerPaiements();
-    // Actualisation automatique toutes les 15 secondes
     const interval = setInterval(() => { chargerStatut(); chargerPaiements(); }, 15000);
     return () => clearInterval(interval);
   }, []);
@@ -1210,7 +1469,7 @@ function CampayPaiements({ token }) {
     setLoadingVerif(reference);
     try {
       const r = await axios.post(
-        `/api/admin/campay/forcer-verification/${reference}`,
+        `/api/admin/fapshi/forcer-verification/${reference}`,
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -1230,7 +1489,7 @@ function CampayPaiements({ token }) {
   return (
     <div className="tab-content">
       <h2 className="section-title">
-        <><CreditCard size={20} /> Campay — Paiements Mobile Money</>
+        <><CreditCard size={20} /> Fapshi — Paiements Mobile Money</>
         <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "normal", marginLeft: "12px" }}>
           <><RefreshCw size={12} /> Auto-actualisation 15s</>
         </span>
@@ -1238,10 +1497,10 @@ function CampayPaiements({ token }) {
 
       {msg.text && <div className={`feedback ${msg.type}`}>{msg.text}</div>}
 
-      {/* Statut Campay */}
+      {/* Statut Fapshi */}
       <div className="admin-section">
         <div className="section-header">
-          <h3>Statut de la connexion Campay</h3>
+          <h3>Statut de la connexion Fapshi</h3>
           <button className="filtre-btn actif" onClick={chargerStatut} disabled={loadingStatut}>
             {loadingStatut ? "..." : "Tester"}
           </button>
@@ -1256,15 +1515,13 @@ function CampayPaiements({ token }) {
                 <div className="stat-label">Credentials .env</div>
               </div>
             </div>
-            <div className={`stat-card ${statut.tokenOk ? "green" : statut.configure ? "red" : "dark"}`}>
-              <div className="stat-icon">{statut.tokenOk ? <Lock size={24} /> : <Unlock size={24} />}</div>
+            <div className={`stat-card ${statut.configure ? "green" : "dark"}`}>
+              <div className="stat-icon">{statut.configure ? <Lock size={24} /> : <Unlock size={24} />}</div>
               <div className="stat-info">
                 <div className="stat-value" style={{ fontSize: "14px" }}>
-                  {statut.tokenOk
-                    ? `Token OK (${statut.tokenEtat?.expiresIn || 0}s)`
-                    : statut.configure ? "Erreur auth" : "—"}
+                  {statut.configure ? "OK" : "—"}
                 </div>
-                <div className="stat-label">Token d'accès</div>
+                <div className="stat-label">Clés API</div>
               </div>
             </div>
             <div className="stat-card blue">
@@ -1293,10 +1550,10 @@ function CampayPaiements({ token }) {
             marginTop: "12px",
             padding: "10px 14px",
             borderRadius: "8px",
-            background: statut.tokenOk ? "#f0fdf4" : statut.configure ? "#fef2f2" : "#f8fafc",
-            border: `1px solid ${statut.tokenOk ? "#bbf7d0" : statut.configure ? "#fecaca" : "#e2e8f0"}`,
+            background: statut.configure ? "#f0fdf4" : "#f8fafc",
+            border: `1px solid ${statut.configure ? "#bbf7d0" : "#e2e8f0"}`,
             fontSize: "13px",
-            color: statut.tokenOk ? "#166534" : statut.configure ? "#991b1b" : "#475569"
+            color: statut.configure ? "#166534" : "#475569"
           }}>
             {statut.message}
           </div>
@@ -1306,9 +1563,8 @@ function CampayPaiements({ token }) {
           <div style={{ marginTop: "12px", padding: "12px 16px", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: "8px", fontSize: "13px", color: "#92400e" }}>
             <strong>Configuration requise :</strong> Ajoutez dans <code>backend/.env</code> :
             <pre style={{ margin: "8px 0 0", fontFamily: "monospace", fontSize: "12px", background: "#fef3c7", padding: "8px", borderRadius: "6px" }}>
-{`CAMPAY_APP_USERNAME=votre_username
-CAMPAY_APP_PASSWORD=votre_password
-CAMPAY_BASE_URL=https://demo.campay.net/api`}
+{`FAPSHI_API_USER=votre_api_user
+FAPSHI_API_KEY=FAK_TEST_votre_cle_sandbox`}
             </pre>
           </div>
         )}
@@ -1325,7 +1581,7 @@ CAMPAY_BASE_URL=https://demo.campay.net/api`}
             <table>
               <thead>
                 <tr>
-                  <th>Référence Campay</th>
+                  <th>Référence Paiement</th>
                   <th>Forfait</th>
                   <th>Montant</th>
                   <th>Téléphone</th>
@@ -1366,11 +1622,11 @@ CAMPAY_BASE_URL=https://demo.campay.net/api`}
         </div>
       )}
 
-      {/* Historique des paiements Campay */}
+      {/* Historique des paiements Fapshi */}
       {paiements && (
         <div className="admin-section">
           <div className="section-header">
-            <h3><><List size={16} /> Historique paiements Campay ({paiements.totalHistorique})</></h3>
+            <h3><><List size={16} /> Historique paiements Fapshi ({paiements.totalHistorique})</></h3>
             <button className="btn-export" onClick={() => {
               if (!paiements.historique.length) return;
               const headers = Object.keys(paiements.historique[0]).join(",");
@@ -1378,7 +1634,7 @@ CAMPAY_BASE_URL=https://demo.campay.net/api`}
               const csv = [headers, ...rows].join("\n");
               const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
               const url = URL.createObjectURL(blob);
-              const a = document.createElement("a"); a.href = url; a.download = "paiements-campay.csv"; a.click();
+              const a = document.createElement("a"); a.href = url; a.download = "paiements-fapshi.csv"; a.click();
               URL.revokeObjectURL(url);
             }}><><Download size={14} /> CSV</></button>
           </div>
@@ -1387,7 +1643,7 @@ CAMPAY_BASE_URL=https://demo.campay.net/api`}
               <thead>
                 <tr>
                   <th>Code Ticket</th>
-                  <th>Référence Campay</th>
+                  <th>Référence Fapshi</th>
                   <th>Forfait</th>
                   <th>Montant</th>
                   <th>Téléphone</th>
@@ -1398,7 +1654,7 @@ CAMPAY_BASE_URL=https://demo.campay.net/api`}
               </thead>
               <tbody>
                 {paiements.historique.length === 0 ? (
-                  <tr><td colSpan="8" className="empty-msg">Aucun paiement Campay enregistré.</td></tr>
+                  <tr><td colSpan="8" className="empty-msg">Aucun paiement Fapshi enregistré.</td></tr>
                 ) : paiements.historique.map((p, i) => (
                   <tr key={i}>
                     <td className="code-cell">{p.code}</td>
@@ -1425,15 +1681,16 @@ CAMPAY_BASE_URL=https://demo.campay.net/api`}
 
       {/* Guide d'intégration webhook */}
       <div className="admin-section" style={{ background: "#f8fafc", border: "1px solid #e2e8f0" }}>
-        <h3 style={{ color: "#475569" }}>Webhook Campay (notifications push)</h3>
+        <h3 style={{ color: "#475569" }}>Webhook Fapshi (notifications push)</h3>
         <div style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.6 }}>
-          <p>Pour recevoir les confirmations de paiement en temps réel (sans polling), configurez le webhook dans votre tableau de bord Campay :</p>
+          <p>Pour recevoir les confirmations de paiement en temps réel (sans polling), configurez le webhook dans votre tableau de bord Fapshi :</p>
           <div style={{ background: "#1e293b", color: "#e2e8f0", borderRadius: "8px", padding: "12px 16px", fontFamily: "monospace", fontSize: "12px", margin: "10px 0" }}>
             POST <span style={{ color: "#86efac" }}>https://votre-domaine.com/api/paiement/webhook</span>
           </div>
           <p>Ajoutez également dans <code>backend/.env</code> :</p>
           <pre style={{ background: "#f1f5f9", padding: "10px", borderRadius: "6px", fontSize: "12px" }}>
-{`CAMPAY_WEBHOOK_URL=https://votre-domaine.com/api/paiement/webhook`}
+{`FAPSHI_WEBHOOK_URL=https://votre-domaine.com/api/paiement/webhook
+FAPSHI_WEBHOOK_SECRET=votre_secret_dashboard`}
           </pre>
         </div>
       </div>
@@ -1483,12 +1740,12 @@ function AdminPage() {
     { id: "tickets",            label: <><Ticket size={16} /> Tickets</>              },
     { id: "hotspots",           label: <><Wifi size={16} /> Hotspots</>             },
     { id: "mikrotik",           label: <><Router size={16} /> Mikrotik</>             },
-    { id: "campay",             label: <><CreditCard size={16} /> Paiements Campay</>     },
+    { id: "fapshi",             label: <><CreditCard size={16} /> Paiements Fapshi</>     },
     { id: "domicile",           label: <><Home size={16} /> Domicile</>             },
     { id: "comptes-privilegies",label: <><Star size={16} /> Privilégiés</>          },
     { id: "clients",            label: <><Users size={16} /> Clients</>              },
     { id: "stats",              label: <><BarChart3 size={16} /> Stats</>                },
-    { id: "comptabilite",       label: <><DollarSign size={16} /> Comptabilité</>         },
+    { id: "finances",           label: <><DollarSign size={16} /> Gestion d'Argent</>     },
     { id: "blacklist",          label: <><ShieldBan size={16} /> Blacklist</>            },
     { id: "logs",               label: <><ScrollText size={16} /> Journaux</>             },
     { id: "parametres",         label: <><Settings size={16} /> Paramètres</>           },
@@ -1533,12 +1790,12 @@ function AdminPage() {
           {onglet === "tickets"             && <Tickets          token={token} />}
           {onglet === "hotspots"            && <Hotspots         token={token} />}
           {onglet === "mikrotik"            && <Mikrotik         token={token} />}
-          {onglet === "campay"              && <CampayPaiements  token={token} />}
+          {onglet === "fapshi"              && <FapshiPaiements  token={token} />}
           {onglet === "domicile"            && <Domicile         token={token} />}
           {onglet === "comptes-privilegies" && <ComptePrivilegie token={token} />}
           {onglet === "clients"             && <Clients          token={token} />}
           {onglet === "stats"               && <Stats            token={token} />}
-          {onglet === "comptabilite"        && <Comptabilite     token={token} />}
+          {onglet === "finances"            && <Finances         token={token} />}
           {onglet === "blacklist"           && <Blacklist        token={token} />}
           {onglet === "logs"                && <Logs             token={token} />}
           {onglet === "parametres"          && <Parametres       token={token} />}

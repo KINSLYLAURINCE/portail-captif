@@ -5,7 +5,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const mk = require("./mikrotik");
-const campay = require("./campay");
+const fapshi = require("./fapshi");
 const db = require("./db");
 
 const app = express();
@@ -1058,6 +1058,122 @@ app.get("/api/admin/comptabilite", adminAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────
+// FINANCES — GESTION D'ARGENT COMPLÈTE
+// ─────────────────────────────────────────
+
+/**
+ * GET /api/admin/finances
+ * Vue complète de l'argent généré : total, par ticket, par forfait, par jour,
+ * par mode de paiement, tickets gratuits, filtres.
+ * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD&forfaitId=X&gratuit=0|1
+ */
+app.get("/api/admin/finances", adminAuth, async (req, res) => {
+    const { from, to, forfaitId, gratuit } = req.query;
+    const filters = [];
+    const params = [];
+
+    if (from) {
+        params.push(from);
+        filters.push(`t.date_creation::date >= $${params.length}::date`);
+    }
+    if (to) {
+        params.push(to);
+        filters.push(`t.date_creation::date <= $${params.length}::date`);
+    }
+    if (forfaitId) {
+        params.push(parseInt(forfaitId));
+        filters.push(`t.forfait_id = $${params.length}`);
+    }
+    if (gratuit === "1") filters.push(`t.gratuit = true`);
+    if (gratuit === "0") filters.push(`t.gratuit = false`);
+
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    // ── Tickets payants avec leurs paiements
+    const ticketsRows = await pool.query(`
+        SELECT
+            t.id, t.code, t.forfait_nom, t.prix, t.statut, t.telephone, t.operateur,
+            t.gratuit, t.campay_reference, t.date_creation,
+            c.debut AS connexion_debut, c.ip AS connexion_ip
+        FROM tickets t
+        LEFT JOIN connexions c ON c.ticket = t.code
+        ${where}
+        ORDER BY t.date_creation DESC
+    `, params);
+
+    const tickets = ticketsRows.rows.map(mapRow);
+
+    // ── Totaux
+    const totauxRows = await pool.query(`
+        SELECT
+            COUNT(*)::int AS total_tickets,
+            COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette_payante,
+            COALESCE(SUM(CASE WHEN gratuit = true THEN prix ELSE 0 END), 0)::int AS recette_gratuite,
+            COUNT(*) FILTER (WHERE gratuit = true)::int AS tickets_gratuits,
+            COUNT(*) FILTER (WHERE gratuit = false)::int AS tickets_payants,
+            COUNT(*) FILTER (WHERE statut = 'utilise')::int AS tickets_utilises,
+            COUNT(*) FILTER (WHERE statut = 'disponible')::int AS tickets_disponibles
+        FROM tickets t
+        ${where}
+    `, params);
+
+    // ── Recettes par jour
+    const parJourRows = await pool.query(`
+        SELECT date_creation::date::text AS jour,
+               COUNT(*)::int AS tickets,
+               COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette
+        FROM tickets t
+        ${where}
+        GROUP BY 1 ORDER BY 1 DESC
+    `, params);
+
+    // ── Recettes par forfait
+    const parForfaitRows = await pool.query(`
+        SELECT COALESCE(forfait_nom, 'Inconnu') AS forfait,
+               COUNT(*)::int AS tickets,
+               COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette
+        FROM tickets t
+        ${where}
+        GROUP BY 1 ORDER BY recette DESC
+    `, params);
+
+    // ── Recettes par opérateur
+    const parOperateurRows = await pool.query(`
+        SELECT COALESCE(NULLIF(operateur, ''), 'Inconnu') AS operateur,
+               COUNT(*)::int AS tickets,
+               COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette
+        FROM tickets t
+        ${where}
+        GROUP BY 1 ORDER BY recette DESC
+    `, params);
+
+    // ── Connexions facturées (source de vérité pour la recette réelle)
+    const connexionsRows = await pool.query(`
+        SELECT c.id, c.ticket, c.ip, c.forfait, c.montant, c.debut, c.fin
+        FROM connexions c
+        ORDER BY c.debut DESC
+        LIMIT 500
+    `);
+
+    const recetteReelle = connexionsRows.rows.reduce((sum, r) => sum + (r.montant || 0), 0);
+
+    res.json({
+        success: true,
+        tickets,
+        totaux: {
+            ...totauxRows.rows[0],
+            recetteReelle,
+            totalEncaissable: totauxRows.rows[0].recette_payante
+        },
+        parJour: parJourRows.rows,
+        parForfait: parForfaitRows.rows,
+        parOperateur: parOperateurRows.rows,
+        connexions: connexionsRows.rows.map(mapRow),
+        filtres: { from: from || null, to: to || null, forfaitId: forfaitId || null, gratuit: gratuit || null }
+    });
+});
+
+// ─────────────────────────────────────────
 // MIKROTIK — ROUTES ADMIN
 // ─────────────────────────────────────────
 
@@ -1233,14 +1349,14 @@ app.delete("/api/admin/comptes-privilegies/:id", adminAuth, async (req, res) => 
 });
 
 // ─────────────────────────────────────────
-// CAMPAY — PAIEMENT MOBILE MONEY RÉEL
+// FAPSHI — PAIEMENT MOBILE MONEY RÉEL
 // ─────────────────────────────────────────
 
 /**
- * Stockage en mémoire des paiements en cours (référence → contexte)
+ * Stockage en mémoire des paiements en cours (transId → contexte)
  * Permet de retrouver le contexte (forfait, appareil) lors de la vérification
  * sans le renvoyer au client (sécurité).
- * Structure : Map<campayRef, { forfaitId, telephone, operateur, appareilId, ip, dateInitiation }>
+ * Structure : Map<transId, { forfaitId, telephone, operateur, appareilId, ip, dateInitiation }>
  */
 const paiementsEnCours = new Map();
 
@@ -1256,7 +1372,7 @@ setInterval(() => {
 
 /**
  * POST /api/paiement/initier
- * Initie un paiement Campay (Orange Money / MTN MoMo)
+ * Initie un paiement Fapshi (Orange Money / MTN MoMo)
  * Body: { forfaitId, telephone, operateur, deviceId }
  */
 app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
@@ -1266,12 +1382,11 @@ app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
         return res.status(400).json({ success: false, message: "Forfait et numéro de téléphone requis." });
     }
 
-    // Vérifier que Campay est configuré
-    if (!campay.estConfigure()) {
+    if (!fapshi.estConfigure()) {
         return res.status(503).json({
             success: false,
             message: "Paiement Mobile Money non configuré. Contactez l'administrateur.",
-            campayManquant: true
+            fapshiManquant: true
         });
     }
 
@@ -1292,73 +1407,58 @@ app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
     const userAgent = req.headers["user-agent"] || "";
     const appareilId = genDeviceId(ip, userAgent, deviceId);
 
-    // Vérifier si un paiement en cours existe déjà pour cet appareil + forfait (évite les doublons)
+    // Vérifier si un paiement en cours existe déjà pour cet appareil + forfait
     for (const [ref, ctx] of paiementsEnCours.entries()) {
         if (
             ctx.appareilId === appareilId &&
             ctx.forfaitId === forfait.id &&
-            Date.now() - ctx.dateInitiation < 5 * 60 * 1000 // moins de 5 min
+            Date.now() - ctx.dateInitiation < 5 * 60 * 1000
         ) {
             return res.json({
                 success: true,
                 reference: ref,
-                ussd_code: ctx.ussd_code || null,
-                operator: ctx.operator || null,
                 message: "Paiement déjà en cours. Confirmez sur votre téléphone.",
                 existant: true
             });
         }
     }
 
-    // Générer une référence externe unique pour cette transaction
     const refExterne = `SMD-${Date.now()}-${appareilId.slice(0, 8).replace(/[^A-Z0-9]/gi, "")}`;
 
-    // Construire l'URL webhook si configurée
-    const webhookUrl = process.env.CAMPAY_WEBHOOK_URL || null;
-
-    // Initier le paiement chez Campay
-    const result = await campay.initierPaiement(
+    const result = await fapshi.initierPaiement(
         telephone,
         forfait.prix,
         `Forfait Wi-Fi ${forfait.nom} — SMD-CONNECT`,
-        refExterne,
-        webhookUrl
+        refExterne
     );
 
     if (!result.success) {
-        await ajouterLog("paiement", `❌ Échec initiation paiement Campay pour "${forfait.nom}" (${telephone}): ${result.message}`);
+        await ajouterLog("paiement", `❌ Échec initiation paiement Fapshi pour "${forfait.nom}" (${telephone}): ${result.message}`);
         return res.status(502).json({ success: false, message: result.message });
     }
 
-    // Stocker le contexte en mémoire (côté serveur uniquement — sécurité)
-    paiementsEnCours.set(result.reference, {
+    paiementsEnCours.set(result.transId, {
         forfaitId: forfait.id,
         telephone: telephone.trim(),
-        operateur: operateur || result.operator || "",
+        operateur: operateur || "",
         appareilId,
         ip,
-        ussd_code: result.ussd_code,
-        operator: result.operator,
         dateInitiation: Date.now()
     });
 
-    await ajouterLog("paiement", `📲 Paiement Campay initié — ${forfait.prix} FCFA pour "${forfait.nom}" (${telephone}, ref: ${result.reference})`);
+    await ajouterLog("paiement", `📲 Paiement Fapshi initié — ${forfait.prix} FCFA pour "${forfait.nom}" (${telephone}, transId: ${result.transId})`);
 
     return res.json({
         success: true,
-        reference: result.reference,
-        ussd_code: result.ussd_code,
-        operator: result.operator,
+        reference: result.transId,
         message: result.message
-        // ⚠️ Pas de _ctx renvoyé au client — le contexte est stocké côté serveur
     });
 });
 
 /**
  * POST /api/paiement/verifier
- * Vérifie le statut d'un paiement Campay et génère le ticket si succès
+ * Vérifie le statut d'un paiement Fapshi et génère le ticket si succès
  * Body: { reference, deviceId }
- * Note: forfaitId, telephone, operateur sont récupérés depuis paiementsEnCours (côté serveur)
  */
 app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
     const { reference, deviceId } = req.body;
@@ -1367,7 +1467,6 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
         return res.status(400).json({ success: false, message: "Référence de paiement requise." });
     }
 
-    // Vérifier d'abord si un ticket a déjà été généré pour cette référence (idempotence)
     const ticketExistantRes = await pool.query("SELECT * FROM tickets WHERE campay_reference = $1", [reference]);
     if (ticketExistantRes.rows.length > 0) {
         const ticketExistant = mapRow(ticketExistantRes.rows[0]);
@@ -1383,35 +1482,26 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
         });
     }
 
-    // Récupérer le contexte depuis la mémoire serveur
     const ctx = paiementsEnCours.get(reference);
-
-    // Vérifier le statut chez Campay
-    const result = await campay.verifierPaiement(reference);
+    const result = await fapshi.verifierPaiement(reference);
 
     if (!result.success) {
         return res.status(502).json({ success: false, message: result.message, status: "FAILED" });
     }
 
-    // Paiement encore en attente
-    if (result.status === "PENDING") {
-        return res.json({ success: true, status: "PENDING", message: result.message });
+    if (result.status === "PENDING" || result.status === "CREATED") {
+        return res.json({ success: true, status: result.status, message: result.message });
     }
 
-    // Paiement échoué
-    if (result.status === "FAILED") {
-        // Nettoyer le contexte
+    if (result.status === "FAILED" || result.status === "EXPIRED") {
         paiementsEnCours.delete(reference);
-
         const telLog = ctx?.telephone || "?";
         const nomForfaitLog = ctx ? ((await pool.query("SELECT nom FROM forfaits WHERE id = $1", [ctx.forfaitId])).rows[0]?.nom || `ID:${ctx.forfaitId}`) : "?";
-        await ajouterLog("paiement", `❌ Paiement Campay ÉCHOUÉ — ref: ${reference}, forfait: "${nomForfaitLog}", tel: ${telLog}`);
-        return res.json({ success: false, status: "FAILED", message: result.message });
+        await ajouterLog("paiement", `❌ Paiement Fapshi ${result.status} — ref: ${reference}, forfait: "${nomForfaitLog}", tel: ${telLog}`);
+        return res.json({ success: false, status: result.status, message: result.message });
     }
 
-    // ✅ Paiement SUCCESSFUL — générer le ticket
     if (result.status === "SUCCESSFUL") {
-        // Récupérer le forfait depuis le contexte ou depuis les données
         let forfait = null;
         let ip = req.ip || "inconnu";
         let telephone = "";
@@ -1423,15 +1513,13 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
             forfait = fRes.rows.length > 0 ? mapRow(fRes.rows[0]) : null;
             ip = ctx.ip || ip;
             telephone = ctx.telephone || "";
-            operateur = ctx.operateur || result.operator || "";
+            operateur = ctx.operateur || result.medium || "";
             appareilId = ctx.appareilId || "";
         }
 
-        // Fallback : si le contexte est perdu (redémarrage serveur), utiliser deviceId
         if (!forfait) {
             const userAgent = req.headers["user-agent"] || "";
             appareilId = genDeviceId(ip, userAgent, deviceId);
-            // On ne peut pas retrouver le forfait sans contexte → erreur
             await ajouterLog("paiement", `⚠️ Paiement CONFIRMÉ mais contexte perdu — ref: ${reference}. Ticket non généré automatiquement.`);
             return res.status(409).json({
                 success: false,
@@ -1441,18 +1529,15 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
             });
         }
 
-        // Créer le ticket
         const tRes = await pool.query(
             `INSERT INTO tickets (code, forfait_id, forfait_nom, prix, statut, ip_achat, telephone, operateur, appareil_id, campay_reference)
              VALUES ($1, $2, $3, $4, 'disponible', $5, $6, $7, $8, $9) RETURNING *`,
             [genCode(), forfait.id, forfait.nom, forfait.prix, ip, telephone, operateur, appareilId, reference]
         );
         const t = mapRow(tRes.rows[0]);
-
-        // Nettoyer le contexte
         paiementsEnCours.delete(reference);
 
-        await ajouterLog("paiement", `✅ Paiement Campay CONFIRMÉ — ${forfait.prix} FCFA, forfait "${forfait.nom}", ticket ${t.code} (ref: ${reference}, tel: ${telephone})`);
+        await ajouterLog("paiement", `✅ Paiement Fapshi CONFIRMÉ — ${forfait.prix} FCFA, forfait "${forfait.nom}", ticket ${t.code} (ref: ${reference}, tel: ${telephone})`);
 
         return res.status(201).json({
             success: true,
@@ -1463,50 +1548,51 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
         });
     }
 
-    // Statut inattendu
     return res.json({ success: true, status: result.status, message: result.message });
 });
 
 /**
  * POST /api/paiement/webhook
- * Callback Campay (notification push de statut de paiement)
- * Campay envoie une requête POST avec le statut de la transaction
+ * Callback Fapshi (notification push de statut de paiement)
+ * Vérifie le secret via header x-wh-secret
  */
 app.post("/api/paiement/webhook", async (req, res) => {
-    const data = req.body;
-    console.log("📩 [Campay Webhook] Reçu:", JSON.stringify(data));
+    if (!fapshi.verifierWebhook(req)) {
+        console.warn("⚠️ [Fapshi Webhook] Secret invalide");
+        return res.status(403).json({ success: false, message: "Invalid webhook secret." });
+    }
 
-    // Répondre immédiatement à Campay (éviter les timeouts)
+    const data = req.body;
+    console.log("📩 [Fapshi Webhook] Reçu:", JSON.stringify(data));
+
     res.status(200).json({ success: true, message: "Webhook reçu." });
 
-    // Traiter de manière asynchrone
     try {
-        const reference = data.reference;
+        const transId = data.transId;
         const status = data.status;
 
-        if (!reference || !status) {
+        if (!transId || !status) {
             console.warn("⚠️ [Webhook] Données incomplètes:", data);
             return;
         }
 
-        // Vérifier si un ticket a déjà été généré (idempotence)
-        const dejaLa = await pool.query("SELECT 1 FROM tickets WHERE campay_reference = $1", [reference]);
+        const dejaLa = await pool.query("SELECT 1 FROM tickets WHERE campay_reference = $1", [transId]);
         if (dejaLa.rowCount > 0) {
-            console.log(`ℹ️ [Webhook] Ticket déjà généré pour ref ${reference}`);
+            console.log(`ℹ️ [Webhook] Ticket déjà généré pour transId ${transId}`);
             return;
         }
 
         if (status === "SUCCESSFUL") {
-            const ctx = paiementsEnCours.get(reference);
+            const ctx = paiementsEnCours.get(transId);
             if (!ctx) {
-                console.warn(`⚠️ [Webhook] Contexte introuvable pour ref ${reference}`);
-                await ajouterLog("paiement", `⚠️ Webhook Campay: paiement CONFIRMÉ mais contexte perdu — ref: ${reference}`);
+                console.warn(`⚠️ [Webhook] Contexte introuvable pour transId ${transId}`);
+                await ajouterLog("paiement", `⚠️ Webhook Fapshi: paiement CONFIRMÉ mais contexte perdu — transId: ${transId}`);
                 return;
             }
 
             const fRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ctx.forfaitId]);
             if (fRes.rows.length === 0) {
-                console.warn(`⚠️ [Webhook] Forfait introuvable pour ref ${reference}`);
+                console.warn(`⚠️ [Webhook] Forfait introuvable pour transId ${transId}`);
                 return;
             }
             const forfait = mapRow(fRes.rows[0]);
@@ -1515,17 +1601,17 @@ app.post("/api/paiement/webhook", async (req, res) => {
                 `INSERT INTO tickets (code, forfait_id, forfait_nom, prix, statut, ip_achat, telephone, operateur, appareil_id, campay_reference)
                  VALUES ($1, $2, $3, $4, 'disponible', $5, $6, $7, $8, $9) RETURNING *`,
                 [genCode(), forfait.id, forfait.nom, forfait.prix, ctx.ip, ctx.telephone,
-                 ctx.operateur || data.operator || "", ctx.appareilId, reference]
+                 ctx.operateur || data.medium || "", ctx.appareilId, transId]
             );
             const t = mapRow(tRes.rows[0]);
-            paiementsEnCours.delete(reference);
+            paiementsEnCours.delete(transId);
 
-            await ajouterLog("paiement", `✅ [Webhook] Paiement CONFIRMÉ — ${forfait.prix} FCFA, "${forfait.nom}", ticket ${t.code} (ref: ${reference})`);
-            console.log(`✅ [Webhook] Ticket ${t.code} généré pour ref ${reference}`);
+            await ajouterLog("paiement", `✅ [Webhook] Paiement CONFIRMÉ — ${forfait.prix} FCFA, "${forfait.nom}", ticket ${t.code} (transId: ${transId})`);
+            console.log(`✅ [Webhook] Ticket ${t.code} généré pour transId ${transId}`);
 
         } else if (status === "FAILED") {
-            paiementsEnCours.delete(reference);
-            await ajouterLog("paiement", `❌ [Webhook] Paiement ÉCHOUÉ — ref: ${reference}`);
+            paiementsEnCours.delete(transId);
+            await ajouterLog("paiement", `❌ [Webhook] Paiement ÉCHOUÉ — transId: ${transId}`);
         }
     } catch (err) {
         console.error("❌ [Webhook] Erreur traitement:", err.message);
@@ -1533,62 +1619,49 @@ app.post("/api/paiement/webhook", async (req, res) => {
 });
 
 /**
- * GET /api/campay/statut
- * Retourne le statut de la configuration Campay (public)
+ * GET /api/fapshi/statut
+ * Retourne le statut de la configuration Fapshi (public)
  */
-app.get("/api/campay/statut", (req, res) => {
+app.get("/api/fapshi/statut", (req, res) => {
     res.json({
         success: true,
-        configure: campay.estConfigure(),
-        baseUrl: campay.CAMPAY_BASE_URL,
-        message: campay.estConfigure()
-            ? "Campay configuré — paiement Mobile Money actif"
-            : "Campay non configuré — ajoutez CAMPAY_APP_USERNAME et CAMPAY_APP_PASSWORD dans .env"
+        configure: fapshi.estConfigure(),
+        baseUrl: fapshi.FAPSHI_BASE_URL,
+        message: fapshi.estConfigure()
+            ? "Fapshi configuré — paiement Mobile Money actif"
+            : "Fapshi non configuré — ajoutez FAPSHI_API_USER et FAPSHI_API_KEY dans .env"
     });
 });
 
 /**
- * GET /api/admin/campay/statut
- * Statut Campay pour l'admin (avec test de connexion + paiements en cours)
+ * GET /api/admin/fapshi/statut
+ * Statut Fapshi pour l'admin (avec test de connexion + paiements en cours)
  */
-app.get("/api/admin/campay/statut", adminAuth, async (req, res) => {
-    const configure = campay.estConfigure();
-    let tokenOk = false;
+app.get("/api/admin/fapshi/statut", adminAuth, async (req, res) => {
+    const configure = fapshi.estConfigure();
+    let configOk = configure;
     let erreur = null;
 
-    if (configure) {
-        try {
-            await campay.obtenirToken();
-            tokenOk = true;
-        } catch (e) {
-            erreur = e.message;
-        }
-    }
-
-    const tokenEtat = campay.etatToken();
+    const etat = fapshi.etatToken();
 
     res.json({
         success: true,
         configure,
-        tokenOk,
-        tokenEtat,
-        baseUrl: campay.CAMPAY_BASE_URL,
+        configOk,
+        baseUrl: fapshi.FAPSHI_BASE_URL,
         paiementsEnCours: paiementsEnCours.size,
         erreur,
         message: !configure
-            ? "Campay non configuré. Ajoutez CAMPAY_APP_USERNAME et CAMPAY_APP_PASSWORD dans .env"
-            : tokenOk
-                ? "✅ Campay opérationnel — authentification réussie"
-                : `❌ Campay configuré mais erreur d'auth: ${erreur}`
+            ? "Fapshi non configuré. Ajoutez FAPSHI_API_USER et FAPSHI_API_KEY dans .env"
+            : "✅ Fapshi opérationnel — clés API configurées"
     });
 });
 
 /**
- * GET /api/admin/campay/paiements
- * Liste les paiements en cours et l'historique des paiements Campay
+ * GET /api/admin/fapshi/paiements
+ * Liste les paiements en cours et l'historique des paiements Fapshi
  */
-app.get("/api/admin/campay/paiements", adminAuth, async (req, res) => {
-    // Paiements en cours (en mémoire)
+app.get("/api/admin/fapshi/paiements", adminAuth, async (req, res) => {
     const enCours = [];
     for (const [ref, ctx] of paiementsEnCours.entries()) {
         const fRes = await pool.query("SELECT nom, prix FROM forfaits WHERE id = $1", [ctx.forfaitId]);
@@ -1605,7 +1678,6 @@ app.get("/api/admin/campay/paiements", adminAuth, async (req, res) => {
         });
     }
 
-    // Historique des tickets générés via Campay
     const historiqueRows = await pool.query(
         `SELECT code, campay_reference, forfait_nom, prix, telephone, operateur, statut, date_creation
          FROM tickets WHERE campay_reference IS NOT NULL ORDER BY id DESC LIMIT 50`
@@ -1631,19 +1703,18 @@ app.get("/api/admin/campay/paiements", adminAuth, async (req, res) => {
 });
 
 /**
- * POST /api/admin/campay/forcer-verification/:reference
+ * POST /api/admin/fapshi/forcer-verification/:reference
  * Forcer la vérification d'un paiement en cours (outil admin)
  */
-app.post("/api/admin/campay/forcer-verification/:reference", adminAuth, async (req, res) => {
+app.post("/api/admin/fapshi/forcer-verification/:reference", adminAuth, async (req, res) => {
     const { reference } = req.params;
 
-    const result = await campay.verifierPaiement(reference);
+    const result = await fapshi.verifierPaiement(reference);
     if (!result.success) {
         return res.status(502).json({ success: false, message: result.message });
     }
 
     if (result.status === "SUCCESSFUL") {
-        // Vérifier idempotence
         const dejaLa = await pool.query("SELECT * FROM tickets WHERE campay_reference = $1", [reference]);
         if (dejaLa.rowCount > 0) {
             return res.json({ success: true, status: "SUCCESSFUL", ticket: mapRow(dejaLa.rows[0]), message: "Ticket déjà existant." });
@@ -1668,7 +1739,7 @@ app.post("/api/admin/campay/forcer-verification/:reference", adminAuth, async (r
             `INSERT INTO tickets (code, forfait_id, forfait_nom, prix, statut, ip_achat, telephone, operateur, appareil_id, campay_reference)
              VALUES ($1, $2, $3, $4, 'disponible', $5, $6, $7, $8, $9) RETURNING *`,
             [genCode(), forfait.id, forfait.nom, forfait.prix, ctx.ip, ctx.telephone,
-             ctx.operateur || result.operator || "", ctx.appareilId, reference]
+             ctx.operateur || result.medium || "", ctx.appareilId, reference]
         );
         const t = mapRow(tRes.rows[0]);
         paiementsEnCours.delete(reference);
