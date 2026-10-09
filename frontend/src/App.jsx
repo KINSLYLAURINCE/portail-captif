@@ -33,6 +33,31 @@ function recupererDernierTicket() {
   } catch { return null; }
 }
 
+// ─── Connexion automatique au portail captif Mikrotik (HTTP PAP) ──────────
+const HOTSPOT_LOGIN_URL = "http://192.168.88.1/login";
+function connexionPortailCaptif(code, cible = "http://www.google.com") {
+  if (!code) { window.location.href = cible; return; }
+  try {
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = HOTSPOT_LOGIN_URL;
+    const add = (name, value) => {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    };
+    add("username", code);
+    add("password", code);
+    add("dst", cible);
+    document.body.appendChild(form);
+    form.submit();
+  } catch {
+    window.location.href = cible;
+  }
+}
+
 // ─── QR Code SVG natif (sans dépendance) ──────────────────────────────────
 function QRCodeSVG({ value, size = 140 }) {
   // Génère une matrice QR simplifiée basée sur le code (affichage visuel)
@@ -355,7 +380,7 @@ function PageCodeExistant({ lang, setLang }) {
         setCountdown(c => {
           if (c <= 1) {
             clearInterval(timer);
-            window.location.href = "http://www.google.com";
+            connexionPortailCaptif(code, "http://www.google.com");
             return 0;
           }
           return c - 1;
@@ -1038,7 +1063,7 @@ function PageTicket({ lang, setLang }) {
     if (connecte) {
       const timer = setInterval(() => {
         setCountdown(c => {
-          if (c <= 1) { clearInterval(timer); window.location.href = "http://www.google.com"; return 0; }
+          if (c <= 1) { clearInterval(timer); connexionPortailCaptif(code, "http://www.google.com"); return 0; }
           return c - 1;
         });
       }, 1000);
