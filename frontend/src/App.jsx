@@ -575,8 +575,6 @@ function PagePaiement({ lang, setLang }) {
   const operateurs = [
     { id: "orange", nom: "Orange Money", emoji: "🟠", couleur: "#ff6600", campay: true },
     { id: "mtn",    nom: "MTN MoMo",     emoji: "🟡", couleur: "#ffcc00", campay: true },
-    { id: "moov",   nom: "Moov Money",   emoji: "🔵", couleur: "#0066cc", campay: false },
-    { id: "wave",   nom: "Wave",         emoji: "🌊", couleur: "#1a9bfc", campay: false },
   ];
 
   const MAX_TENTATIVES = 20; // 20 × 3s = 60s max
