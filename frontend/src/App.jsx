@@ -408,7 +408,7 @@ function PageCodeExistant({ lang, setLang }) {
   useEffect(() => {
     const verifier = (c) => {
       if (!c) return;
-      axios.get(`/api/ticket-etat/${encodeURIComponent(c)}`, { params: { deviceId: getDeviceId() } })
+      axios.get(`/api/ticket-etat/${encodeURIComponent(c)}`, { params: { deviceId: getDeviceId(), mac: getMac() } })
         .then(r => {
           if (r.data.valide && r.data.memeAppareil !== false) {
             setCode(c);
@@ -421,7 +421,7 @@ function PageCodeExistant({ lang, setLang }) {
     if (dernier) {
       verifier(dernier);
     } else {
-      axios.get("/api/session", { params: { deviceId: getDeviceId() } })
+      axios.get("/api/session", { params: { deviceId: getDeviceId(), mac: getMac() } })
         .then(r => { if (r.data?.success && r.data.connecte && r.data.ticket) verifier(r.data.ticket); })
         .catch(() => {});
     }

@@ -122,7 +122,16 @@ function genDeviceId(ip, userAgent, deviceId) {
  * Retourne { autorise, lier } : `lier` = true quand aucun appareil n'est
  * encore enregistré (premier usage) → il faut le lier maintenant.
  */
-function verifierAppareil(ticket, ip, userAgent, deviceId) {
+function verifierAppareil(ticket, ip, userAgent, deviceId, mac) {
+    const storedMac = (ticket.mac || "").trim().toUpperCase() || null;
+    const currentMac = (mac || "").trim().toUpperCase() || null;
+
+    // L'adresse MAC est l'identité FORTE de l'appareil : elle reste identique
+    // même si le navigateur change (autre app/webview, localStorage vidé).
+    if (storedMac && currentMac) {
+        return { autorise: storedMac === currentMac, lier: false };
+    }
+
     const stored = (ticket.appareilId || "").trim();
     if (!stored) return { autorise: true, lier: true };
     const actuel = genDeviceId(ip, userAgent, deviceId);
@@ -244,22 +253,24 @@ app.get("/api/tickets/:code", rateLimit(30, 60000), async (req, res) => {
 // ─── Statut de session d'un appareil ─────────────────────────────────────
 app.get("/api/session", async (req, res) => {
     const deviceId = req.query.deviceId;
+    const mac = req.query.mac ? req.query.mac.trim().toUpperCase() : null;
     const ip = req.ip || "inconnu";
 
     // Vérifier blacklist
     const bloque = await pool.query("SELECT 1 FROM blacklist WHERE type = 'ip' AND valeur = $1", [ip]);
     if (bloque.rowCount > 0) return res.status(403).json({ success: false, message: "Accès refusé." });
 
-    if (!deviceId) return res.json({ success: true, connecte: false });
+    if (!deviceId && !mac) return res.json({ success: true, connecte: false });
 
-    // Chercher une connexion active pour cet appareil
+    // Chercher une connexion active pour cet appareil (par identifiant OU par MAC)
     const { rows } = await pool.query(
         `SELECT t.*, c.debut AS connexion_debut
          FROM tickets t
          LEFT JOIN connexions c ON c.ticket = t.code
-         WHERE t.appareil_id = $1 AND t.statut = 'utilise'
+         WHERE t.statut = 'utilise'
+           AND ((t.appareil_id IS NOT NULL AND t.appareil_id = $1) OR (t.mac IS NOT NULL AND UPPER(t.mac) = $2))
          ORDER BY t.id DESC LIMIT 1`,
-        [deviceId]
+        [deviceId || "", mac]
     );
     if (rows.length === 0) return res.json({ success: true, connecte: false });
     const ticket = mapRow(rows[0]);
@@ -331,7 +342,7 @@ app.get("/api/verifier-code/:code", rateLimit(20, 60000), async (req, res) => {
 app.get("/api/ticket-etat/:code", rateLimit(30, 60000), async (req, res) => {
     const code = req.params.code?.trim().toUpperCase();
     if (!code) return res.status(400).json({ success: false, message: "Code requis." });
-    const { deviceId } = req.query;
+    const { deviceId, mac } = req.query;
     const ip = req.ip || "inconnu";
     const userAgent = req.headers["user-agent"] || "";
     try {
@@ -341,7 +352,7 @@ app.get("/api/ticket-etat/:code", rateLimit(30, 60000), async (req, res) => {
         const fRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
         const forfait = fRes.rows[0] ? mapRow(fRes.rows[0]) : null;
 
-        const verifAppareil = verifierAppareil(ticket, req.ip, req.headers["user-agent"] || "", deviceId);
+        const verifAppareil = verifierAppareil(ticket, req.ip, req.headers["user-agent"] || "", deviceId, mac);
 
         let valide = false, actif = false, secondesRestantes = null, raison = null;
         if (!verifAppareil.autorise) {
@@ -521,7 +532,7 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     }
 
     // Un seul appareil autorisé (premier usage ET reconnexion)
-    const verifAppareil = verifierAppareil(ticket, ip, userAgent, deviceId);
+    const verifAppareil = verifierAppareil(ticket, ip, userAgent, deviceId, macNorm);
     if (!verifAppareil.autorise) {
         return { status: 403, body: { success: false, message: "Ce code est déjà utilisé sur un autre appareil." } };
     }
