@@ -1609,20 +1609,67 @@ app.delete("/api/admin/comptes-privilegies/:id", adminAuth, async (req, res) => 
 // ─────────────────────────────────────────
 
 /**
- * Stockage en mémoire des paiements en cours (transId → contexte)
- * Permet de retrouver le contexte (forfait, appareil) lors de la vérification
- * sans le renvoyer au client (sécurité).
- * Structure : Map<transId, { forfaitId, telephone, operateur, appareilId, ip, dateInitiation }>
+ * Contexte des paiements Fapshi persisté en PostgreSQL (table paiements_fapshi).
+ * Indispensable : le contexte doit survivre aux redémarrages du serveur, sinon
+ * un webhook « SUCCESSFUL » arrivant après un restart perd le forfait/le client
+ * et le ticket n'est jamais généré (client débité mais non connecté).
  */
-const paiementsEnCours = new Map();
+async function enregistrerPaiement(ref, ctx) {
+    await pool.query(
+        `INSERT INTO paiements_fapshi (reference, forfait_id, telephone, operateur, appareil_id, ip, statut)
+         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
+         ON CONFLICT (reference) DO UPDATE SET
+            forfait_id = EXCLUDED.forfait_id,
+            telephone  = EXCLUDED.telephone,
+            operateur  = EXCLUDED.operateur,
+            appareil_id = EXCLUDED.appareil_id,
+            ip         = EXCLUDED.ip,
+            statut     = 'PENDING',
+            date_maj   = now()`,
+        [ref, ctx.forfaitId, ctx.telephone, ctx.operateur, ctx.appareilId, ctx.ip]
+    );
+}
 
-// Nettoyer les paiements en cours de plus de 2 heures (évite les fuites mémoire)
-setInterval(() => {
-    const limite = Date.now() - 2 * 3600 * 1000;
-    for (const [ref, ctx] of paiementsEnCours.entries()) {
-        if (ctx.dateInitiation < limite) {
-            paiementsEnCours.delete(ref);
+async function lirePaiement(ref) {
+    const r = await pool.query("SELECT * FROM paiements_fapshi WHERE reference = $1", [ref]);
+    return r.rows.length ? mapRow(r.rows[0]) : null;
+}
+
+async function marquerPaiement(ref, statut) {
+    await pool.query(
+        "UPDATE paiements_fapshi SET statut = $2, date_maj = now() WHERE reference = $1",
+        [ref, statut]
+    );
+}
+
+async function paiementEnCoursPourAppareil(appareilId, forfaitId) {
+    const r = await pool.query(
+        `SELECT reference FROM paiements_fapshi
+         WHERE appareil_id = $1 AND forfait_id = $2 AND statut = 'PENDING'
+           AND date_initiation > now() - INTERVAL '5 minutes'
+         ORDER BY id DESC LIMIT 1`,
+        [appareilId, forfaitId]
+    );
+    return r.rows.length ? r.rows[0].reference : null;
+}
+
+// Throttle des appels Fapshi par référence (évite les 429 "too many requests for this transId")
+const dernieresVerifsFapshi = new Map();
+const INTERVALLE_VERIF_FAPSHI_MS = 12000;
+
+// Marquer comme EXPIRED les paiements restés en attente depuis plus de 2 h
+setInterval(async () => {
+    try {
+        await pool.query(
+            `UPDATE paiements_fapshi SET statut = 'EXPIRED', date_maj = now()
+             WHERE statut = 'PENDING' AND date_initiation < now() - INTERVAL '2 hours'`
+        );
+        const limite = Date.now() - 3600 * 1000;
+        for (const [ref, ts] of dernieresVerifsFapshi.entries()) {
+            if (ts < limite) dernieresVerifsFapshi.delete(ref);
         }
+    } catch (e) {
+        console.error("Erreur nettoyage paiements Fapshi:", e.message);
     }
 }, 30 * 60 * 1000);
 
@@ -1664,19 +1711,14 @@ app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
     const appareilId = genDeviceId(ip, userAgent, deviceId);
 
     // Vérifier si un paiement en cours existe déjà pour cet appareil + forfait
-    for (const [ref, ctx] of paiementsEnCours.entries()) {
-        if (
-            ctx.appareilId === appareilId &&
-            ctx.forfaitId === forfait.id &&
-            Date.now() - ctx.dateInitiation < 5 * 60 * 1000
-        ) {
-            return res.json({
-                success: true,
-                reference: ref,
-                message: "Paiement déjà en cours. Confirmez sur votre téléphone.",
-                existant: true
-            });
-        }
+    const refExistante = await paiementEnCoursPourAppareil(appareilId, forfait.id);
+    if (refExistante) {
+        return res.json({
+            success: true,
+            reference: refExistante,
+            message: "Paiement déjà en cours. Confirmez sur votre téléphone.",
+            existant: true
+        });
     }
 
     const refExterne = `SMD-${Date.now()}-${appareilId.slice(0, 8).replace(/[^A-Z0-9]/gi, "")}`;
@@ -1693,14 +1735,12 @@ app.post("/api/paiement/initier", rateLimit(5, 60000), async (req, res) => {
         return res.status(502).json({ success: false, message: result.message });
     }
 
-    paiementsEnCours.set(result.transId, {
+    await enregistrerPaiement(result.transId, {
         forfaitId: forfait.id,
         telephone: telephone.trim(),
         operateur: operateur || "",
         appareilId,
-        ip,
-        mode: "direct",
-        dateInitiation: Date.now()
+        ip
     });
 
     await ajouterLog("paiement", `📲 Paiement Fapshi initié — ${forfait.prix} FCFA pour "${forfait.nom}" (${telephone}, transId: ${result.transId})`);
@@ -1739,7 +1779,20 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
         });
     }
 
-    const ctx = paiementsEnCours.get(reference);
+    const ctx = await lirePaiement(reference);
+
+    // Throttle : ne pas interroger Fapshi plus d'une fois toutes les 12 s par référence
+    const maintenant = Date.now();
+    const dernier = dernieresVerifsFapshi.get(reference) || 0;
+    if (maintenant - dernier < INTERVALLE_VERIF_FAPSHI_MS) {
+        return res.json({
+            success: true,
+            status: "PENDING",
+            message: "Vérification en cours de votre paiement..."
+        });
+    }
+    dernieresVerifsFapshi.set(reference, maintenant);
+
     const result = await fapshi.verifierPaiement(reference);
 
     if (!result.success) {
@@ -1751,7 +1804,7 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
     }
 
     if (result.status === "FAILED" || result.status === "EXPIRED") {
-        paiementsEnCours.delete(reference);
+        await marquerPaiement(reference, result.status);
         const telLog = ctx?.telephone || "?";
         const nomForfaitLog = ctx ? ((await pool.query("SELECT nom FROM forfaits WHERE id = $1", [ctx.forfaitId])).rows[0]?.nom || `ID:${ctx.forfaitId}`) : "?";
         await ajouterLog("paiement", `❌ Paiement Fapshi ${result.status} — ref: ${reference}, forfait: "${nomForfaitLog}", tel: ${telLog}`);
@@ -1792,7 +1845,7 @@ app.post("/api/paiement/verifier", rateLimit(60, 60000), async (req, res) => {
             [genCode(), forfait.id, forfait.nom, forfait.prix, ip, telephone, operateur, appareilId, reference]
         );
         const t = mapRow(tRes.rows[0]);
-        paiementsEnCours.delete(reference);
+        await marquerPaiement(reference, "PAID");
 
         await ajouterLog("paiement", `✅ Paiement Fapshi CONFIRMÉ — ${forfait.prix} FCFA, forfait "${forfait.nom}", ticket ${t.code} (ref: ${reference}, tel: ${telephone})`);
 
@@ -1840,7 +1893,7 @@ app.post("/api/paiement/webhook", async (req, res) => {
         }
 
         if (status === "SUCCESSFUL") {
-            const ctx = paiementsEnCours.get(transId);
+            const ctx = await lirePaiement(transId);
             if (!ctx) {
                 console.warn(`⚠️ [Webhook] Contexte introuvable pour transId ${transId}`);
                 await ajouterLog("paiement", `⚠️ Webhook Fapshi: paiement CONFIRMÉ mais contexte perdu — transId: ${transId}`);
@@ -1861,13 +1914,13 @@ app.post("/api/paiement/webhook", async (req, res) => {
                  ctx.operateur || data.medium || "", ctx.appareilId, transId]
             );
             const t = mapRow(tRes.rows[0]);
-            paiementsEnCours.delete(transId);
+            await marquerPaiement(transId, "PAID");
 
             await ajouterLog("paiement", `✅ [Webhook] Paiement CONFIRMÉ — ${forfait.prix} FCFA, "${forfait.nom}", ticket ${t.code} (transId: ${transId})`);
             console.log(`✅ [Webhook] Ticket ${t.code} généré pour transId ${transId}`);
 
         } else if (status === "FAILED") {
-            paiementsEnCours.delete(transId);
+            await marquerPaiement(transId, "FAILED");
             await ajouterLog("paiement", `❌ [Webhook] Paiement ÉCHOUÉ — transId: ${transId}`);
         }
     } catch (err) {
@@ -1896,18 +1949,18 @@ app.get("/api/fapshi/statut", (req, res) => {
  */
 app.get("/api/admin/fapshi/statut", adminAuth, async (req, res) => {
     const configure = fapshi.estConfigure();
-    let configOk = configure;
-    let erreur = null;
 
-    const etat = fapshi.etatToken();
+    const enCoursRes = await pool.query(
+        "SELECT COUNT(*)::int AS n FROM paiements_fapshi WHERE statut = 'PENDING' AND date_initiation > now() - INTERVAL '2 hours'"
+    );
 
     res.json({
         success: true,
         configure,
-        configOk,
+        configOk: configure,
         baseUrl: fapshi.FAPSHI_BASE_URL,
-        paiementsEnCours: paiementsEnCours.size,
-        erreur,
+        paiementsEnCours: enCoursRes.rows[0].n,
+        erreur: null,
         message: !configure
             ? "Fapshi non configuré. Ajoutez FAPSHI_API_USER et FAPSHI_API_KEY dans .env"
             : "✅ Fapshi opérationnel — clés API configurées"
@@ -1919,21 +1972,28 @@ app.get("/api/admin/fapshi/statut", adminAuth, async (req, res) => {
  * Liste les paiements en cours et l'historique des paiements Fapshi
  */
 app.get("/api/admin/fapshi/paiements", adminAuth, async (req, res) => {
-    const enCours = [];
-    for (const [ref, ctx] of paiementsEnCours.entries()) {
-        const fRes = await pool.query("SELECT nom, prix FROM forfaits WHERE id = $1", [ctx.forfaitId]);
-        const forfait = fRes.rows[0];
-        enCours.push({
-            reference: ref,
-            forfait: forfait?.nom || `ID:${ctx.forfaitId}`,
-            montant: forfait?.prix || 0,
-            telephone: ctx.telephone,
-            operateur: ctx.operateur,
-            ip: ctx.ip,
-            dateInitiation: new Date(ctx.dateInitiation).toISOString(),
-            ageMins: Math.round((Date.now() - ctx.dateInitiation) / 60000)
-        });
-    }
+    const enCoursRows = await pool.query(
+        `SELECT p.reference, p.forfait_id, p.telephone, p.operateur, p.ip, p.date_initiation,
+                f.nom AS forfait_nom, f.prix AS forfait_prix
+         FROM paiements_fapshi p
+         LEFT JOIN forfaits f ON f.id = p.forfait_id
+         WHERE p.statut = 'PENDING' AND p.date_initiation > now() - INTERVAL '2 hours'
+         ORDER BY p.id DESC`
+    );
+    const maintenant = Date.now();
+    const enCours = enCoursRows.rows.map(r => {
+        const dateInitiation = new Date(r.date_initiation).getTime();
+        return {
+            reference: r.reference,
+            forfait: r.forfait_nom || `ID:${r.forfait_id}`,
+            montant: r.forfait_prix || 0,
+            telephone: r.telephone,
+            operateur: r.operateur,
+            ip: r.ip,
+            dateInitiation: new Date(r.date_initiation).toISOString(),
+            ageMins: Math.round((maintenant - dateInitiation) / 60000)
+        };
+    });
 
     const historiqueRows = await pool.query(
         `SELECT code, campay_reference, forfait_nom, prix, telephone, operateur, statut, date_creation
@@ -1977,7 +2037,7 @@ app.post("/api/admin/fapshi/forcer-verification/:reference", adminAuth, async (r
             return res.json({ success: true, status: "SUCCESSFUL", ticket: mapRow(dejaLa.rows[0]), message: "Ticket déjà existant." });
         }
 
-        const ctx = paiementsEnCours.get(reference);
+        const ctx = await lirePaiement(reference);
         if (!ctx) {
             return res.status(404).json({
                 success: false,
@@ -1999,7 +2059,7 @@ app.post("/api/admin/fapshi/forcer-verification/:reference", adminAuth, async (r
              ctx.operateur || result.medium || "", ctx.appareilId, reference]
         );
         const t = mapRow(tRes.rows[0]);
-        paiementsEnCours.delete(reference);
+        await marquerPaiement(reference, "PAID");
 
         await ajouterLog("paiement", `✅ [Admin] Ticket ${t.code} généré manuellement pour ref ${reference} (${forfait.nom})`);
 
@@ -2124,9 +2184,11 @@ app.get(/^\/(?!api(\/|$)).*/, (req, res) => {
 
 app.use((err, req, res, next) => {
     console.error("Erreur serveur:", err.message);
-    if (!res.headersSent) {
-        res.status(500).json({ success: false, message: "Erreur interne du serveur." });
+    // Erreur de type PostgreSQL : paramètre entier invalide (ex: "NaN")
+    if (err.code === "22P02" || /invalid input syntax for type integer/i.test(err.message || "")) {
+        return res.status(400).json({ success: false, message: "Paramètre invalide." });
     }
+    res.status(500).json({ success: false, message: "Erreur serveur." });
 });
 
 // ─────────────────────────────────────────

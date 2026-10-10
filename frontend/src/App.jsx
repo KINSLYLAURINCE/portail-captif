@@ -627,7 +627,7 @@ function PagePaiement({ lang, setLang }) {
   const [tentatives, setTentatives] = useState(0);
   const [messageAttente, setMessageAttente] = useState("");
   // Compteur de secondes restantes (60s max)
-  const [secondesRestantes, setSecondesRestantes] = useState(60);
+  const [secondesRestantes, setSecondesRestantes] = useState(300);
 
   // Opérateurs supportés par Fapshi (Orange Money + MTN MoMo)
   const operateurs = [
@@ -635,7 +635,7 @@ function PagePaiement({ lang, setLang }) {
     { id: "mtn",    nom: "MTN MoMo",     emoji: "🟡", couleur: "#ffcc00", campay: true },
   ];
 
-  const MAX_TENTATIVES = 20; // 20 × 3s = 60s max
+  const MAX_TENTATIVES = 60; // 60 × 5s = 5 min max (confirmation Mobile Money)
 
   // Charger le forfait depuis l'URL
   useEffect(() => {
@@ -680,16 +680,16 @@ function PagePaiement({ lang, setLang }) {
         // PENDING → continuer le polling
         compteur++;
         setTentatives(compteur);
-        setSecondesRestantes(Math.max(0, 60 - compteur * 3));
+        setSecondesRestantes(Math.max(0, 300 - compteur * 5));
 
         if (compteur >= MAX_TENTATIVES) {
-          setErreur("Délai d'attente dépassé (60s). Vérifiez votre téléphone et réessayez.");
+          setErreur("Confirmation non reçue dans le délai. Si vous avez bien été débité, votre ticket sera généré automatiquement — rechargez cette page dans quelques minutes.");
           setEtapePaiement("echec");
           return;
         }
 
-        // Attendre 3 secondes avant la prochaine vérification
-        setTimeout(verifier, 3000);
+        // Attendre 5 secondes avant la prochaine vérification
+        setTimeout(verifier, 5000);
       } catch (err) {
         if (!annule) {
           // Erreur réseau temporaire → réessayer une fois
@@ -890,7 +890,7 @@ function PagePaiement({ lang, setLang }) {
               <li>Vérifiez que le numéro est correct</li>
             </ul>
           </div>
-          <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setFapshiRef(null); setUssdCode(null); setTentatives(0); setSecondesRestantes(60); }}>
+          <button className="btn-primary" onClick={() => { setEtapePaiement("confirmation"); setErreur(""); setFapshiRef(null); setUssdCode(null); setTentatives(0); setSecondesRestantes(300); }}>
             🔄 Réessayer
           </button>
           <button className="btn-secondary" onClick={() => navigate("/forfaits")}>{t.changerForfait}</button>

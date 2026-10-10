@@ -160,6 +160,21 @@ CREATE TABLE IF NOT EXISTS appareils_gratuits (
     date_utilisation TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (appareil_id, forfait_id)
 );
+
+CREATE TABLE IF NOT EXISTS paiements_fapshi (
+    id               SERIAL PRIMARY KEY,
+    reference        VARCHAR(100) NOT NULL UNIQUE,
+    forfait_id       INTEGER REFERENCES forfaits(id) ON DELETE SET NULL,
+    telephone        VARCHAR(30),
+    operateur        VARCHAR(30),
+    appareil_id      TEXT,
+    ip               VARCHAR(60),
+    statut           VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    date_initiation  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    date_maj         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_paiements_fapshi_ref ON paiements_fapshi(reference);
+CREATE INDEX IF NOT EXISTS idx_paiements_fapshi_statut ON paiements_fapshi(statut);
 `;
 
 // ─── Seeds par défaut (uniquement si tables vides — installation fraîche) ─

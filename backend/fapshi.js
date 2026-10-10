@@ -109,10 +109,15 @@ async function verifierPaiement(transId) {
                 message: statusMessage(status),
             };
         } catch (err) {
-            if (err.response?.status === 429 && tentative < MAX_RETRIES) {
-                console.warn(`⚠️ [Fapshi] Rate limit (429), attente...`);
-                await new Promise((r) => setTimeout(r, 2000 * (tentative + 1)));
-                continue;
+            if (err.response?.status === 429) {
+                console.warn(`⚠️ [Fapshi] Rate limit (429) sur ${transId} — on repasse en attente`);
+                return {
+                    success: true,
+                    status: "PENDING",
+                    medium: null,
+                    amount: null,
+                    message: "Vérification en attente (limite de requêtes Fapshi).",
+                };
             }
 
             const msg =
