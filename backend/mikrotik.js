@@ -458,6 +458,19 @@ async function listerProfils() {
 }
 
 /**
+ * Lister les serveurs Hotspot configurés sur Mikrotik
+ */
+async function listerHotspots() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", data: [] };
+    try {
+        const result = await mikrotikCommand(["/ip/hotspot/print"]);
+        return { success: true, data: result.data || [] };
+    } catch (err) {
+        return { success: false, message: err.message, data: [] };
+    }
+}
+
+/**
  * Ajouter une adresse MAC en bypass hotspot (accès sans portail captif)
  * Utilise /ip/hotspot/user avec le profil "bypass" ou crée un utilisateur sans limite
  * @param {string} mac - Adresse MAC (ex: AA:BB:CC:DD:EE:FF)
@@ -545,6 +558,7 @@ module.exports = {
     informationsUtilisateurHotspot,
     listerClientsActifs,
     listerProfils,
+    listerHotspots,
     ajouterMacBypass,
     supprimerMacBypass,
 };

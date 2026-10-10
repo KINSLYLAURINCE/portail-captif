@@ -1299,70 +1299,43 @@ function Parametres({ token }) {
 
 // ─── Hotspots ──────────────────────────────────────────────────────────
 function Hotspots({ token }) {
-  const [hotspots, setHotspots] = useState([]);
-  const [msg, setMsg] = useState({ text: "", type: "" });
-  const [form, setForm] = useState({ nom: "", lieu: "", ip: "", debit: "10 Mbps" });
-  const [loading, setLoading] = useState(false);
-  const showMsg = (text, type = "success") => { setMsg({ text, type }); setTimeout(() => setMsg({ text: "", type: "" }), 3000); };
-  const charger = () => axios.get("/api/admin/hotspots", { headers: { Authorization: `Bearer ${token}` } }).then(r => setHotspots(r.data.hotspots)).catch(() => {});
-  useEffect(() => { charger(); }, []);
+  const [data, setData] = useState(null);
+  const hdr = { headers: { Authorization: `Bearer ${token}` } };
+  const charger = () => axios.get("/api/admin/hotspots", hdr).then(r => setData(r.data)).catch(() => setData({ success: false, connecte: false, hotspots: [] }));
+  useEffect(() => { charger(); const i = setInterval(charger, 10000); return () => clearInterval(i); }, []);
 
-  const handleCreer = async (e) => {
-    e.preventDefault();
-    if (!form.nom.trim()) { showMsg("Nom requis.", "error"); return; }
-    setLoading(true);
-    try {
-      await axios.post("/api/admin/hotspots", form, { headers: { Authorization: `Bearer ${token}` } });
-      showMsg(`Hotspot "${form.nom}" créé !`);
-      setForm({ nom: "", lieu: "", ip: "", debit: "10 Mbps" });
-      charger();
-    } catch (err) { showMsg(err.response?.data?.message || "Erreur.", "error"); }
-    finally { setLoading(false); }
-  };
-
-  const handleToggle = async (id) => {
-    try { const r = await axios.patch(`/api/admin/hotspots/${id}/toggle`, {}, { headers: { Authorization: `Bearer ${token}` } }); showMsg(r.data.message); charger(); }
-    catch { showMsg("Erreur.", "error"); }
-  };
-
-  const handleSupprimer = async (id, nom) => {
-    if (!window.confirm(`Supprimer "${nom}" ?`)) return;
-    try { await axios.delete(`/api/admin/hotspots/${id}`, { headers: { Authorization: `Bearer ${token}` } }); showMsg(`"${nom}" supprimé.`); charger(); }
-    catch { showMsg("Erreur.", "error"); }
-  };
+  const hotspots = data?.hotspots || [];
+  const clientsTotal = hotspots.reduce((a, h) => a + (h.clients || 0), 0);
 
   return (
     <div className="tab-content">
-      <h2 className="section-title"><><Wifi size={20} /> Gestion des Hotspots</></h2>
-      {msg.text && <div className={`feedback ${msg.type}`}>{msg.text}</div>}
+      <h2 className="section-title"><><Wifi size={20} /> Hotspots (routeur Mikrotik)</></h2>
       <div className="admin-section">
-        <h3><><Plus size={16} /> Créer un hotspot</></h3>
-        <form onSubmit={handleCreer}>
-          <div className="form-row">
-            <div className="form-group"><label>Nom</label><input type="text" placeholder="Ex: Hotspot Salle" value={form.nom} onChange={e => setForm({ ...form, nom: e.target.value })} /></div>
-            <div className="form-group"><label>Lieu</label><input type="text" placeholder="Ex: Salle d'attente" value={form.lieu} onChange={e => setForm({ ...form, lieu: e.target.value })} /></div>
-            <div className="form-group"><label>IP</label><input type="text" placeholder="Ex: 192.168.1.1" value={form.ip} onChange={e => setForm({ ...form, ip: e.target.value })} /></div>
-            <div className="form-group"><label>Débit</label><input type="text" placeholder="Ex: 10 Mbps" value={form.debit} onChange={e => setForm({ ...form, debit: e.target.value })} /></div>
-            <div className="form-group form-btn"><button type="submit" disabled={loading}>{loading ? "..." : "Créer"}</button></div>
+        <div className="mikrotik-status">
+          <div className="mikrotik-card">
+            <h4>Routeur</h4>
+            <div className={`value ${data?.connecte ? "ok" : "err"}`}>{data?.connecte ? "Connecté" : "Déconnecté"}</div>
           </div>
-        </form>
+          <div className="mikrotik-card"><h4>Hotspots</h4><div className="value">{hotspots.length}</div></div>
+          <div className="mikrotik-card"><h4>Clients connectés</h4><div className="value">{clientsTotal}</div></div>
+        </div>
+        {data && !data.connecte && <div className="feedback error" style={{ marginTop: 10 }}>{data.message || "Mikrotik injoignable."}</div>}
+        <div className="form-group form-btn" style={{ marginTop: 12 }}>
+          <button className="btn-edit" onClick={charger}>Rafraîchir</button>
+        </div>
       </div>
       <div className="admin-section">
         <h3><><List size={16} /> Liste des hotspots ({hotspots.length})</></h3>
         <div className="table-wrapper"><table>
-          <thead><tr><th>Nom</th><th>Lieu</th><th>IP</th><th>Débit</th><th>Clients</th><th>Statut</th><th>Actions</th></tr></thead>
-          <tbody>{hotspots.length === 0 ? <tr><td colSpan="7" className="empty-msg">Aucun hotspot.</td></tr> : hotspots.map(h => (
+          <thead><tr><th>Nom</th><th>Interface</th><th>Profil</th><th>Pool</th><th>Clients</th><th>Statut</th></tr></thead>
+          <tbody>{hotspots.length === 0 ? <tr><td colSpan="6" className="empty-msg">Aucun hotspot détecté sur le routeur.</td></tr> : hotspots.map(h => (
             <tr key={h.id}>
               <td><strong>{h.nom}</strong></td>
-              <td>{h.lieu || "—"}</td>
-              <td><span className="code-cell">{h.ip || "—"}</span></td>
-              <td>{h.debit}</td>
+              <td><span className="code-cell">{h.interface || "—"}</span></td>
+              <td>{h.profil || "—"}</td>
+              <td>{h.pool || "—"}</td>
               <td><span className="badge blue">{h.clients || 0}</span></td>
               <td><span className={`badge ${h.statut === "actif" ? "actif" : "inactif"}`}>{h.statut === "actif" ? "Actif" : "Inactif"}</span></td>
-              <td className="actions-cell">
-                <button className={`btn-toggle ${h.statut === "actif" ? "desactiver" : "activer"}`} onClick={() => handleToggle(h.id)}>{h.statut === "actif" ? "Désactiver" : "Activer"}</button>
-                <button className="btn-supprimer" onClick={() => handleSupprimer(h.id, h.nom)}>Supprimer</button>
-              </td>
             </tr>
           ))}</tbody>
         </table></div>

@@ -728,6 +728,18 @@ app.get("/api/admin/dashboard", adminAuth, async (req, res) => {
     `, [today]);
 
     const s = rows[0];
+
+    // Hotspots : état réel du routeur Mikrotik (fallback sur la base si injoignable)
+    let totalHotspots = s.total_hotspots;
+    let hotspotsActifs = s.hotspots_actifs;
+    try {
+        const hs = await mk.listerHotspots();
+        if (hs.success && Array.isArray(hs.data)) {
+            totalHotspots = hs.data.length;
+            hotspotsActifs = hs.data.filter(h => h.disabled !== "true" && h.disabled !== true).length;
+        }
+    } catch {}
+
     res.json({
         success: true,
         stats: {
@@ -735,8 +747,8 @@ app.get("/api/admin/dashboard", adminAuth, async (req, res) => {
             forfaitsActifs:    s.forfaits_actifs,
             totalTickets:      s.total_tickets,
             ticketsDispos:     s.tickets_dispos,
-            totalHotspots:     s.total_hotspots,
-            hotspotsActifs:    s.hotspots_actifs,
+            totalHotspots,
+            hotspotsActifs,
             clientsConnectes:  s.clients_connectes,
             totalDomiciles:    s.total_domiciles,
             domicilesActifs:   s.domiciles_actifs,
@@ -922,8 +934,39 @@ app.delete("/api/admin/tickets/:id", adminAuth, async (req, res) => {
 // ─────────────────────────────────────────
 
 app.get("/api/admin/hotspots", adminAuth, async (req, res) => {
-    const { rows } = await pool.query("SELECT * FROM hotspots ORDER BY id");
-    res.json({ success: true, hotspots: mapRows(rows) });
+    const test = await mk.testerConnexion();
+    const [srv, act] = await Promise.all([mk.listerHotspots(), mk.listerClientsActifs()]);
+    const actives = act.success ? (act.data || []) : [];
+
+    // Compter les clients actifs par serveur hotspot
+    const countParNom = {};
+    for (const s of actives) {
+        const nom = s.server;
+        if (!nom) continue;
+        countParNom[nom] = (countParNom[nom] || 0) + 1;
+    }
+
+    const hotspots = (srv.data || []).map(h => {
+        const desactive = h.disabled === "true" || h.disabled === true;
+        return {
+            id: h[".id"],
+            nom: h.name,
+            interface: h.interface || null,
+            profil: h.profile || null,
+            pool: h["address-pool"] || null,
+            https: h.HTTPS === "true" || h.HTTPS === true,
+            clients: countParNom[h.name] || 0,
+            statut: desactive ? "inactif" : "actif",
+            source: "mikrotik"
+        };
+    });
+
+    res.json({
+        success: true,
+        connecte: test.success,
+        message: test.success ? null : (test.message || "Mikrotik injoignable"),
+        hotspots
+    });
 });
 
 app.post("/api/admin/hotspots", adminAuth, async (req, res) => {
