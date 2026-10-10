@@ -328,9 +328,8 @@ async function creerUtilisateurHotspot(code, profilNom, duree, mac, quota) {
             `=profile=${profilNom}`,
             `=limit-uptime=${dureesMK}`,
         ];
-        // Lier l'utilisateur à une seule adresse MAC si connue (appareil unique)
-        const macMK = normaliserMac(mac);
-        if (macMK) words.push(`=mac-address=${macMK}`);
+        // Aucune restriction MAC : le code est utilisable sur tout appareil.
+        // (la libération de la connexion au changement de MAC est ainsi évitée)
 
         // Limiter le volume total (ex: 500 Mo). RouterOS coupe l'abonné dès
         // que quota_in + quota_out atteint cette valeur, même après reconnexion.
@@ -340,7 +339,7 @@ async function creerUtilisateurHotspot(code, profilNom, duree, mac, quota) {
         await mikrotikCommand(words);
         return {
             success: true,
-            message: `Utilisateur "${code}" créé sur Mikrotik${macMK ? ` (MAC ${macMK})` : ""}${quotaOctets ? ` (quota ${quota})` : ""}`,
+            message: `Utilisateur "${code}" créé sur Mikrotik${quotaOctets ? ` (quota ${quota})` : ""}`,
         };
     } catch (err) {
         return { success: false, message: `Erreur Mikrotik: ${err.message}` };

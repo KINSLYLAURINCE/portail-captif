@@ -116,38 +116,17 @@ function genDeviceId(ip, userAgent, deviceId) {
 }
 
 /**
- * Vérifie qu'un ticket est bien utilisé par son appareil d'origine.
- * Un ticket est lié à UN SEUL appareil (celui du premier usage) mais reste
- * réutilisable autant de fois que nécessaire tant qu'il n'est pas expiré.
+ * Restriction appareil SUPPRIMÉE : un ticket peut être utilisé sur n'importe
+ * quel appareil. La MAC/navigateur ne servent plus qu'à titre indicatif (le
+ * premier appareil vu est simplement mémorisé pour l'affichage admin).
  *
- * Identité FORTE = navigateur (deviceId persistant dans le localStorage) :
- * stable même quand la MAC Wi-Fi est randomisée par le téléphone. La MAC sert
- * de preuve secondaire (même appareil, autre navigateur).
- *
- * Retourne { autorise, lier, rebindMac } :
- *  - lier      : true quand aucun appareil n'est encore enregistré (1er usage)
- *  - rebindMac : true quand la MAC a changé → mettre à jour la MAC du user
- *                MikroTik et la colonne tickets.mac.
+ * Retourne toujours { autorise: true }. `lier` = true au tout premier usage
+ * quand aucune identité n'est encore enregistrée.
  */
 function verifierAppareil(ticket, ip, userAgent, deviceId, mac) {
-    const storedMac = (ticket.mac || "").trim().toUpperCase() || null;
-    const currentMac = (mac || "").trim().toUpperCase() || null;
-
     const stored = (ticket.appareilId || "").trim();
-    const actuel = genDeviceId(ip, userAgent, deviceId);
-
-    // Aucune identité enregistrée → premier usage : autoriser et lier.
-    if (!stored && !storedMac) return { autorise: true, lier: true };
-
-    const memeNavigateur = !!stored && stored === actuel;
-    const memeMac = !!storedMac && !!currentMac && storedMac === currentMac;
-
-    if (memeNavigateur || memeMac) {
-        return { autorise: true, lier: false, rebindMac: !!currentMac && currentMac !== storedMac };
-    }
-    // Compatibilité avec d'anciens tickets liés à l'IP+User-Agent
-    if (stored === `${ip}|${(userAgent || "").slice(0, 50)}`) return { autorise: true, lier: false };
-    return { autorise: false, lier: false };
+    const storedMac = (ticket.mac || "").trim() || null;
+    return { autorise: true, lier: !stored && !storedMac, rebindMac: false };
 }
 
 /**
@@ -584,16 +563,12 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     if (forfaitRes.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
     const forfait = mapRow(forfaitRes.rows[0]);
 
-    // Lier l'appareil au premier usage (ex. tickets créés par l'admin sans appareil)
+    // Mémoriser le premier appareil vu (indicatif uniquement, aucune restriction)
     if (verifAppareil.lier) {
         await pool.query(
             "UPDATE tickets SET appareil_id = COALESCE(appareil_id, $1), ip_achat = COALESCE(ip_achat, $2), mac = COALESCE(mac, $3) WHERE id = $4",
             [genDeviceId(ip, userAgent, deviceId), ip, mac || null, ticket.id]
         );
-    } else if (mac && (!ticket.mac || verifAppareil.rebindMac)) {
-        // La MAC a changé (randomisation Wi-Fi) → rattacher le ticket à la
-        // nouvelle MAC de l'appareil reconnu.
-        await pool.query("UPDATE tickets SET mac = $1 WHERE id = $2", [mac, ticket.id]);
     }
 
     // Enregistrer la connexion
@@ -613,26 +588,17 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
         );
     } catch {}
 
-    // Activer l'appareil sur Mikrotik (uniquement au premier usage, pour ne pas
-    // remettre à zéro le temps restant d'un ticket déjà utilisé)
+    // Activer le ticket sur Mikrotik (uniquement au premier usage, pour ne pas
+    // remettre à zéro le temps restant d'un ticket déjà utilisé).
+    // Aucune adresse MAC n'est liée : le code marche sur n'importe quel appareil.
     let mikrotikOk = false;
     if (mk.MIKROTIK_ENABLED && !reconnexion) {
         try {
-            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, mac, forfait.quota);
+            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, null, forfait.quota);
             mikrotikOk = mkResult.success;
-            if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code${mac ? ` (MAC ${mac})` : ""}`);
+            if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code`);
         } catch (e) {
             console.error("Mikrotik login-code error:", e.message);
-        }
-    } else if (mk.MIKROTIK_ENABLED && reconnexion && mac && verifAppareil.rebindMac) {
-        // Le téléphone a randomisé sa MAC Wi-Fi : le user MikroTik est encore
-        // lié à l'ancienne MAC, ce qui ferait échouer la connexion. On le rebinde.
-        try {
-            const mkRes = await mk.definirMacUtilisateurHotspot(ticket.code, mac);
-            mikrotikOk = mkRes.success;
-            if (mkRes.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" rebindé à la MAC ${mac}`);
-        } catch (e) {
-            console.error("Mikrotik rebind MAC error:", e.message);
         }
     }
 
@@ -2137,52 +2103,9 @@ async function verifierExpirations() {
 setInterval(verifierExpirations, 5 * 60 * 1000);
 
 // ─────────────────────────────────────────
-// LIAISON / CONTRÔLE MAC (un seul appareil par ticket)
-// Chaque ticket est lié à la première adresse MAC qui l'utilise. Ensuite,
-// l'utilisateur hotspot Mikrotik est verrouillé sur cette MAC et toute session
-// active provenant d'une autre MAC est immédiatement coupée.
+// (Restriction MAC supprimée) — un ticket est utilisable sur tout appareil.
+// Plus de verrouillage par adresse MAC ni de déconnexion automatique.
 // ─────────────────────────────────────────
-
-let _macEnCours = false;
-
-async function verifierMacSessions() {
-    if (!mk.MIKROTIK_ENABLED || _macEnCours) return;
-    _macEnCours = true;
-    try {
-        const res = await mk.listerClientsActifs();
-        if (!res.success || !Array.isArray(res.data)) return;
-
-        for (const s of res.data) {
-            const user = s.user;
-            const mac = s["mac-address"] ? s["mac-address"].trim().toUpperCase() : null;
-            const id = s[".id"];
-            if (!user || !mac) continue;
-
-            const tRes = await pool.query("SELECT id, mac FROM tickets WHERE code = $1", [user]);
-            if (tRes.rows.length === 0) continue;
-            const ticket = tRes.rows[0];
-            const ticketMac = ticket.mac ? ticket.mac.trim().toUpperCase() : null;
-
-            if (!ticketMac) {
-                // Premier appareil détecté → liaison définitive
-                await pool.query("UPDATE tickets SET mac = $1 WHERE id = $2", [mac, ticket.id]);
-                await mk.definirMacUtilisateurHotspot(user, mac);
-                await ajouterLog("mikrotik", `Ticket ${user} lié à l'appareil ${mac}`);
-            } else if (ticketMac !== mac) {
-                // Appareil non autorisé → coupure immédiate de la session
-                await mk.retirerSessionActiveParId(id);
-                await ajouterLog("connexion", `Session ${user} coupée — appareil ${mac} non autorisé (lié à ${ticketMac})`);
-            }
-        }
-    } catch (e) {
-        console.error("Erreur verifierMacSessions:", e.message);
-    } finally {
-        _macEnCours = false;
-    }
-}
-
-// Contrôle des sessions MAC toutes les 8 secondes
-setInterval(verifierMacSessions, 8 * 1000);
 
 // ─────────────────────────────────────────
 // FALLBACK SPA (React Router)
