@@ -13,6 +13,23 @@ const MIKROTIK_USER     = process.env.MIKROTIK_USER     || "admin";
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || "";
 const MIKROTIK_ENABLED  = process.env.MIKROTIK_ENABLED  === "true";
 
+// ─── Utilitaires de parse de durées RouterOS ───────────────────────────────
+function parseTempsSec(val) {
+    if (!val) return 0;
+    const v = String(val);
+    if (/^\d+:\d\d:\d\d/.test(v)) {
+        const p = v.split(":").map(Number);
+        return (p[0] * 3600) + ((p[1] || 0) * 60) + (p[2] || 0);
+    }
+    if (v === "0s" || v === "0") return 0;
+    const m = v.match(/(\d+)([wdhms])/g);
+    if (!m) return 0;
+    const f = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 };
+    let s = 0;
+    for (const pair of m) s += parseInt(pair) * (f[pair.slice(-1)] || 0);
+    return s;
+}
+
 // ─── Encodage du protocole API Mikrotik ────────────────────────────────────
 function encodeLength(len) {
     if (len < 0x80) return Buffer.from([len]);
@@ -32,45 +49,6 @@ function encodeSentence(words) {
     return Buffer.concat(parts);
 }
 
-function decodeResponse(data) {
-    const sentences = [];
-    let current = {};
-    let i = 0;
-
-    while (i < data.length) {
-        // Lire la longueur
-        let len = 0;
-        const b = data[i];
-        if (b < 0x80) { len = b; i++; }
-        else if (b < 0xC0) { len = ((b & 0x3F) << 8) | data[i + 1]; i += 2; }
-        else if (b < 0xE0) { len = ((b & 0x1F) << 16) | (data[i + 1] << 8) | data[i + 2]; i += 3; }
-        else { len = ((b & 0x0F) << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3]; i += 4; }
-
-        if (len === 0) {
-            sentences.push(current);
-            current = {};
-            continue;
-        }
-
-        const word = data.slice(i, i + len).toString("utf8");
-        i += len;
-
-        if (word === "!done") { sentences.push({ type: "done" }); }
-        else if (word === "!re") { current = { type: "re" }; }
-        else if (word === "!trap") { current = { type: "trap" }; }
-        else if (word.startsWith("=")) {
-            const eq = word.indexOf("=", 1);
-            if (eq > 0) {
-                current[word.slice(1, eq)] = word.slice(eq + 1);
-            }
-        } else if (word.startsWith(".id=")) {
-            current[".id"] = word.slice(4);
-        }
-    }
-
-    return sentences;
-}
-
 // ─── Connexion et exécution d'une commande ─────────────────────────────────
 function mikrotikCommand(words, timeout = 5000) {
     return new Promise((resolve, reject) => {
@@ -81,7 +59,66 @@ function mikrotikCommand(words, timeout = 5000) {
         const socket = new net.Socket();
         let buffer = Buffer.alloc(0);
         let authenticated = false;
+        let current = null;
+        let consumed = 0;
         const results = [];
+
+        // Parser incrémental : consume les octets traités pour ne pas re-lire
+        // les anciennes réponses (ex: le !done du login) à chaque événement data.
+        function parseBuffer() {
+            const sentences = [];
+            let i = 0;
+            while (i < buffer.length) {
+                const itemStart = i;
+                let len = 0;
+                const b = buffer[i];
+                if (b < 0x80) { len = b; i += 1; }
+                else if (b < 0xC0) {
+                    if (i + 2 > buffer.length) { i = itemStart; break; }
+                    len = ((b & 0x3F) << 8) | buffer[i + 1]; i += 2;
+                }
+                else if (b < 0xE0) {
+                    if (i + 3 > buffer.length) { i = itemStart; break; }
+                    len = ((b & 0x1F) << 16) | (buffer[i + 1] << 8) | buffer[i + 2]; i += 3;
+                }
+                else {
+                    if (i + 4 > buffer.length) { i = itemStart; break; }
+                    len = ((b & 0x0F) << 24) | (buffer[i + 1] << 16) | (buffer[i + 2] << 8) | buffer[i + 3]; i += 4;
+                }
+
+                if (len === 0) {
+                    sentences.push(current || {});
+                    current = null;
+                    consumed = i;
+                    continue;
+                }
+
+                if (i + len > buffer.length) { i = itemStart; break; }
+
+                const word = buffer.slice(i, i + len).toString("utf8");
+                i += len;
+                consumed = i;
+
+                if (word === "!done") { sentences.push({ type: "done" }); }
+                else if (word === "!re") { current = { type: "re" }; }
+                else if (word === "!trap") { current = { type: "trap" }; }
+                else if (word.startsWith("=")) {
+                    const eq = word.indexOf("=", 1);
+                    if (eq > 0) {
+                        if (!current) current = { type: "re" };
+                        current[word.slice(1, eq)] = word.slice(eq + 1);
+                    }
+                } else if (word.startsWith(".id=")) {
+                    if (!current) current = { type: "re" };
+                    current[".id"] = word.slice(4);
+                }
+            }
+            if (consumed > 0) {
+                buffer = buffer.slice(consumed);
+                consumed = 0;
+            }
+            return sentences;
+        }
 
         const timer = setTimeout(() => {
             socket.destroy();
@@ -99,7 +136,7 @@ function mikrotikCommand(words, timeout = 5000) {
 
         socket.on("data", (data) => {
             buffer = Buffer.concat([buffer, data]);
-            const sentences = decodeResponse(buffer);
+            const sentences = parseBuffer();
 
             for (const s of sentences) {
                 if (!authenticated) {
@@ -150,6 +187,7 @@ function mikrotikCommand(words, timeout = 5000) {
 async function testerConnexion() {
     try {
         const result = await mikrotikCommand(["/system/identity/print"]);
+        if (!result.success) return { success: false, message: result.message || "Erreur connexion Mikrotik" };
         return { success: true, message: "Connexion Mikrotik réussie", data: result.data };
     } catch (err) {
         return { success: false, message: err.message };
@@ -267,6 +305,112 @@ async function supprimerUtilisateurHotspot(code) {
         return { success: true, message: `Utilisateur "${code}" supprimé sur Mikrotik` };
     } catch (err) {
         return { success: false, message: `Erreur Mikrotik: ${err.message}` };
+    }
+}
+
+/**
+ * Normalise une adresse MAC pour Mikrotik (majuscules, séparateur ":").
+ */
+function normaliserMac(mac) {
+    if (!mac) return null;
+    return mac.trim().toUpperCase().replace(/-/g, ":");
+}
+
+async function creerUtilisateurHotspot(code, profilNom, duree, mac) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        // Convertir la durée en format Mikrotik (ex: "1 heure" → "01:00:00")
+        const dureeMap = {
+            "30 minutes": "00:30:00",
+            "1 heure":    "01:00:00",
+            "2 heures":   "02:00:00",
+            "3 heures":   "03:00:00",
+            "6 heures":   "06:00:00",
+            "12 heures":  "12:00:00",
+            "24 heures":  "1d",
+            "3 jours":    "3d",
+            "7 jours":    "7d",
+            "30 jours":   "30d",
+            "Illimité":   "0s",
+        };
+        const dureesMK = dureeMap[duree] || "01:00:00";
+
+        const words = [
+            "/ip/hotspot/user/add",
+            `=name=${code}`,
+            `=password=${code}`,
+            `=profile=${profilNom}`,
+            `=limit-uptime=${dureesMK}`,
+        ];
+        // Lier l'utilisateur à une seule adresse MAC si connue (appareil unique)
+        const macMK = normaliserMac(mac);
+        if (macMK) words.push(`=mac-address=${macMK}`);
+
+        await mikrotikCommand(words);
+        return { success: true, message: `Utilisateur "${code}" créé sur Mikrotik${macMK ? ` (MAC ${macMK})` : ""}` };
+    } catch (err) {
+        return { success: false, message: `Erreur Mikrotik: ${err.message}` };
+    }
+}
+
+/**
+ * Lier (ou mettre à jour) l'adresse MAC d'un utilisateur Hotspot existant.
+ * Une fois la MAC définie, RouterOS n'accepte plus aucune autre adresse MAC
+ * pour cet utilisateur : le ticket est lié à un seul appareil.
+ */
+async function definirMacUtilisateurHotspot(code, mac) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    const macMK = normaliserMac(mac);
+    if (!macMK) return { success: false, message: "MAC invalide" };
+    try {
+        const existing = await mikrotikCommand(["/ip/hotspot/user/print", `?name=${code}`]);
+        if (!existing.data || existing.data.length === 0) {
+            return { success: false, message: `Utilisateur "${code}" introuvable` };
+        }
+        const id = existing.data[0][".id"];
+        await mikrotikCommand(["/ip/hotspot/user/set", `=.id=${id}`, `=mac-address=${macMK}`]);
+        return { success: true, message: `Utilisateur "${code}" lié à la MAC ${macMK}` };
+    } catch (err) {
+        return { success: false, message: `Erreur Mikrotik: ${err.message}` };
+    }
+}
+
+/**
+ * Retirer une session active par son identifiant interne (.id)
+ */
+async function retirerSessionActiveParId(id) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        await mikrotikCommand(["/ip/hotspot/active/remove", `=.id=${id}`]);
+        return { success: true, message: `Session ${id} déconnectée` };
+    } catch (err) {
+        return { success: false, message: `Erreur Mikrotik: ${err.message}` };
+    }
+}
+
+/**
+ * Informations d'un utilisateur hotspot (temps restant, session active)
+ * @param {string} code - Nom d'utilisateur hotspot (code ticket)
+ */
+async function informationsUtilisateurHotspot(code) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", existe: false, restant: 0 };
+    try {
+        const res = await mikrotikCommand(["/ip/hotspot/user/print", `?name=${code}`]);
+        const u = res.data && res.data[0];
+        if (!u) return { success: true, existe: false, actif: false, restant: 0 };
+        const limite = parseTempsSec(u["limit-uptime"]);
+        const utilise = parseTempsSec(u.uptime);
+        let restant = limite === 0 ? null : Math.max(0, limite - utilise);
+        let actif = false;
+        const actifs = await mikrotikCommand(["/ip/hotspot/active/print", `?user=${code}`]);
+        if (actifs.data && actifs.data[0]) {
+            actif = true;
+            const stl = parseTempsSec(actifs.data[0]["session-time-left"]);
+            if (stl > 0) restant = stl;
+        }
+        return { success: true, existe: true, actif, restant, limite, utilise };
+    } catch (err) {
+        return { success: false, message: err.message, existe: false, actif: false, restant: 0 };
     }
 }
 
@@ -395,7 +539,10 @@ module.exports = {
     supprimerProfilHotspot,
     creerUtilisateurHotspot,
     supprimerUtilisateurHotspot,
+    definirMacUtilisateurHotspot,
+    retirerSessionActiveParId,
     deconnecterClient,
+    informationsUtilisateurHotspot,
     listerClientsActifs,
     listerProfils,
     ajouterMacBypass,

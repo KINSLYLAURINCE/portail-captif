@@ -14,6 +14,25 @@ const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "smd-connect-jwt-secret-change-in-production";
 const JWT_EXPIRES = "8h";
 
+function uptimeToSecondes(u) {
+    if (!u) return 0;
+    let s = 0;
+    const facteurs = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 };
+    const m = String(u).match(/(\d+)([wdhms])/g);
+    if (!m) return 0;
+    for (const pair of m) s += parseInt(pair) * (facteurs[pair.slice(-1)] || 0);
+    return s;
+}
+
+function octetsLisible(n) {
+    if (n == null || isNaN(n)) return null;
+    if (n < 1024) return `${n} o`;
+    const unites = ["Ko", "Mo", "Go", "To"];
+    let v = n, i = -1;
+    do { v /= 1024; i++; } while (v >= 1024 && i < unites.length - 1);
+    return `${v.toFixed(v >= 100 ? 0 : 1)} ${unites[i]}`;
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -94,6 +113,23 @@ function genDeviceId(ip, userAgent, deviceId) {
     if (deviceId && deviceId.length > 8) return deviceId;
     const ua = (userAgent || "").slice(0, 50);
     return `${ip}|${ua}`;
+}
+
+/**
+ * Vérifie qu'un ticket est bien utilisé par son appareil d'origine.
+ * Un ticket est lié à UN SEUL appareil (celui du premier usage) mais reste
+ * réutilisable autant de fois que nécessaire tant qu'il n'est pas expiré.
+ * Retourne { autorise, lier } : `lier` = true quand aucun appareil n'est
+ * encore enregistré (premier usage) → il faut le lier maintenant.
+ */
+function verifierAppareil(ticket, ip, userAgent, deviceId) {
+    const stored = (ticket.appareilId || "").trim();
+    if (!stored) return { autorise: true, lier: true };
+    const actuel = genDeviceId(ip, userAgent, deviceId);
+    if (stored === actuel) return { autorise: true, lier: false };
+    // Compatibilité avec d'anciens tickets liés à l'IP+User-Agent
+    if (stored === `${ip}|${(userAgent || "").slice(0, 50)}`) return { autorise: true, lier: false };
+    return { autorise: false, lier: false };
 }
 
 /**
@@ -291,6 +327,71 @@ app.get("/api/verifier-code/:code", rateLimit(20, 60000), async (req, res) => {
     });
 });
 
+// ─── État d'un code (temps restant Mikrotik) pour réutilisation auto ──────
+app.get("/api/ticket-etat/:code", rateLimit(30, 60000), async (req, res) => {
+    const code = req.params.code?.trim().toUpperCase();
+    if (!code) return res.status(400).json({ success: false, message: "Code requis." });
+    const { deviceId } = req.query;
+    const ip = req.ip || "inconnu";
+    const userAgent = req.headers["user-agent"] || "";
+    try {
+        const tRes = await pool.query("SELECT * FROM tickets WHERE code = $1", [code]);
+        if (tRes.rows.length === 0) return res.json({ success: true, valide: false, raison: "inconnu", code });
+        const ticket = mapRow(tRes.rows[0]);
+        const fRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
+        const forfait = fRes.rows[0] ? mapRow(fRes.rows[0]) : null;
+
+        const verifAppareil = verifierAppareil(ticket, req.ip, req.headers["user-agent"] || "", deviceId);
+
+        let valide = false, actif = false, secondesRestantes = null, raison = null;
+        if (!verifAppareil.autorise) {
+            valide = false;
+            raison = "autre_appareil";
+        } else if (ticket.statut === "disponible") {
+            valide = true;
+            secondesRestantes = forfait ? (dureeEnMs(forfait.duree) / 1000) : null;
+        } else if (ticket.statut === "utilise") {
+            const info = await mk.informationsUtilisateurHotspot(code);
+            if (info.existe) {
+                valide = info.restant !== 0;
+                actif = !!info.actif;
+                secondesRestantes = info.restant;
+                if (!valide) raison = "expire";
+            } else if (mk.MIKROTIK_ENABLED) {
+                valide = false;
+                secondesRestantes = 0;
+                raison = "expire";
+            } else {
+                // Mikrotik désactivé → repli sur la durée estimée (début + durée forfait)
+                const cRes = await pool.query("SELECT debut FROM connexions WHERE ticket = $1 ORDER BY id DESC LIMIT 1", [code]);
+                const debut = cRes.rows[0]?.debut ? new Date(cRes.rows[0].debut).getTime() : null;
+                const dureeMs = forfait ? dureeEnMs(forfait.duree) : 0;
+                const restant = debut && dureeMs ? (debut + dureeMs - Date.now()) / 1000 : null;
+                valide = !!restant && restant > 0;
+                secondesRestantes = valide ? restant : 0;
+                if (!valide) raison = "expire";
+            }
+        }
+
+        res.json({
+            success: true,
+            code,
+            valide,
+            raison,
+            memeAppareil: verifAppareil.autorise,
+            actif,
+            secondesRestantes,
+            statut: ticket.statut,
+            forfait: forfait?.nom,
+            quota: forfait?.quota,
+            debit: forfait?.debit,
+            duree: forfait?.duree
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // ─── Accès gratuit (forfait gratuit, 1 seul appareil, non renouvelable) ───
 app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
     const { forfaitId, deviceId } = req.body;
@@ -394,53 +495,82 @@ app.post("/api/acheter", rateLimit(5, 60000), async (req, res) => {
     return res.status(201).json({ success: true, ticket: t, forfait });
 });
 
-// Connexion avec un code existant (vérifie que c'est le même appareil)
-app.post("/api/login-code", rateLimit(10, 60000), async (req, res) => {
-    const { code, deviceId } = req.body;
-    if (!code) return res.status(400).json({ success: false, message: "Code requis." });
-
-    const ip = req.ip || "inconnu";
-    const userAgent = req.headers["user-agent"] || "";
+// Connexion / reconnexion avec un code ticket existant.
+// Règles : un ticket est lié à UN SEUL appareil (celui du premier usage),
+// mais il reste réutilisable autant de fois que nécessaire tant que le temps
+// du forfait n'est pas écoulé.
+async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
+    const codeNorm = (code || "").trim().toUpperCase();
+    const macNorm = mac ? mac.trim().toUpperCase() : null;
 
     // Vérifier blacklist IP
     const bloque = await pool.query("SELECT 1 FROM blacklist WHERE type = 'ip' AND valeur = $1", [ip]);
-    if (bloque.rowCount > 0) return res.status(403).json({ success: false, message: "Accès refusé." });
+    if (bloque.rowCount > 0) {
+        return { status: 403, body: { success: false, message: "Accès refusé." } };
+    }
 
     // Chercher le ticket
-    const ticketRes = await pool.query("SELECT * FROM tickets WHERE code = $1", [code.trim().toUpperCase()]);
+    const ticketRes = await pool.query("SELECT * FROM tickets WHERE code = $1", [codeNorm]);
     if (ticketRes.rows.length === 0) {
-        return res.status(404).json({ success: false, message: "Code invalide ou inexistant." });
+        return { status: 404, body: { success: false, message: "Code invalide ou inexistant." } };
     }
     const ticket = mapRow(ticketRes.rows[0]);
 
-    if (ticket.statut === "utilise") {
-        return res.status(403).json({ success: false, message: "Ce code a déjà été utilisé." });
-    }
-
     if (ticket.statut === "expire") {
-        return res.status(403).json({ success: false, message: "Ce code a expiré." });
+        return { status: 403, body: { success: false, message: "Ce code a expiré." } };
     }
 
-    // Vérifier que c'est le même appareil
-    if (ticket.appareilId) {
-        const appareilActuel = genDeviceId(ip, userAgent, deviceId);
-        if (ticket.appareilId !== appareilActuel) {
-            return res.status(403).json({
-                success: false,
-                message: "Ce code est réservé à l'appareil avec lequel il a été acheté."
-            });
+    // Un seul appareil autorisé (premier usage ET reconnexion)
+    const verifAppareil = verifierAppareil(ticket, ip, userAgent, deviceId);
+    if (!verifAppareil.autorise) {
+        return { status: 403, body: { success: false, message: "Ce code est déjà utilisé sur un autre appareil." } };
+    }
+
+    // Contrôle supplémentaire par adresse MAC (si le ticket est déjà lié à une MAC)
+    if (ticket.mac && mac && ticket.mac.toUpperCase() !== mac.toUpperCase()) {
+        return { status: 403, body: { success: false, message: "Ce code est déjà utilisé sur un autre appareil." } };
+    }
+
+    // Ticket déjà utilisé → autoriser la reconnexion tant que le temps restant
+    // sur Mikrotik n'est pas écoulé (sinon il est considéré expiré).
+    const reconnexion = ticket.statut === "utilise";
+    if (reconnexion) {
+        let restant = null;
+        if (mk.MIKROTIK_ENABLED) {
+            const info = await mk.informationsUtilisateurHotspot(ticket.code);
+            if (!info.existe || info.restant === 0) {
+                return { status: 403, body: { success: false, message: "Ce code a expiré (temps de forfait écoulé)." } };
+            }
+            restant = info.restant;
+        } else {
+            const fRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
+            if (fRes.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
+            const f = mapRow(fRes.rows[0]);
+            const cRes = await pool.query("SELECT debut FROM connexions WHERE ticket = $1 ORDER BY id DESC LIMIT 1", [ticket.code]);
+            const debut = cRes.rows[0]?.debut ? new Date(cRes.rows[0].debut).getTime() : null;
+            const dureeMs = dureeEnMs(f.duree);
+            restant = debut && dureeMs ? (debut + dureeMs - Date.now()) / 1000 : null;
+            if (restant === null || restant <= 0) {
+                return { status: 403, body: { success: false, message: "Ce code a expiré (temps de forfait écoulé)." } };
+            }
         }
-    } else if (ticket.ipAchat && ticket.ipAchat !== ip) {
-        return res.status(403).json({
-            success: false,
-            message: "Ce code est réservé à l'appareil avec lequel il a été acheté."
-        });
+        await ajouterLog("connexion", `Code ${ticket.code} réutilisé — reconnexion autorisée (reste ${Math.round(restant || 0)}s)`);
     }
 
     // Trouver le forfait associé
     const forfaitRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
-    if (forfaitRes.rows.length === 0) return res.status(404).json({ success: false, message: "Forfait introuvable." });
+    if (forfaitRes.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
     const forfait = mapRow(forfaitRes.rows[0]);
+
+    // Lier l'appareil au premier usage (ex. tickets créés par l'admin sans appareil)
+    if (verifAppareil.lier) {
+        await pool.query(
+            "UPDATE tickets SET appareil_id = COALESCE(appareil_id, $1), ip_achat = COALESCE(ip_achat, $2), mac = COALESCE(mac, $3) WHERE id = $4",
+            [genDeviceId(ip, userAgent, deviceId), ip, mac || null, ticket.id]
+        );
+    } else if (mac && !ticket.mac) {
+        await pool.query("UPDATE tickets SET mac = $1 WHERE id = $2", [mac, ticket.id]);
+    }
 
     // Enregistrer la connexion
     await pool.query(
@@ -459,97 +589,62 @@ app.post("/api/login-code", rateLimit(10, 60000), async (req, res) => {
         );
     } catch {}
 
-    // Activer l'appareil sur Mikrotik
+    // Activer l'appareil sur Mikrotik (uniquement au premier usage, pour ne pas
+    // remettre à zéro le temps restant d'un ticket déjà utilisé)
     let mikrotikOk = false;
-    if (mk.MIKROTIK_ENABLED) {
+    if (mk.MIKROTIK_ENABLED && !reconnexion) {
         try {
-            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree);
+            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, mac);
             mikrotikOk = mkResult.success;
-            if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code`);
+            if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code${mac ? ` (MAC ${mac})` : ""}`);
         } catch (e) {
             console.error("Mikrotik login-code error:", e.message);
         }
     }
 
-    await ajouterLog("connexion", `Client ${ip} reconnecté avec code ${ticket.code} — ${forfait.nom}${mikrotikOk ? " [MK OK]" : ""}`);
+    await ajouterLog("connexion", `Client ${ip} connecté avec code ${ticket.code} — ${forfait.nom}${mikrotikOk ? " [MK OK]" : ""}`);
 
-    return res.json({
-        success: true,
-        message: "Connexion réussie !",
-        forfait: forfait.nom,
-        quota: forfait.quota,
-        debit: forfait.debit,
-        mikrotik: mikrotikOk
-    });
+    return {
+        status: 200,
+        body: {
+            success: true,
+            message: reconnexion ? "Reconnexion réussie !" : "Connexion réussie !",
+            forfait: forfait.nom,
+            quota: forfait.quota,
+            debit: forfait.debit,
+            duree: forfait.duree,
+            mikrotik: mikrotikOk
+        }
+    };
+}
+
+// Connexion / reconnexion depuis le formulaire de code
+app.post("/api/login-code", rateLimit(10, 60000), async (req, res) => {
+    const { code, deviceId, mac } = req.body;
+    if (!code) return res.status(400).json({ success: false, message: "Code requis." });
+    const ip = req.ip || "inconnu";
+    const userAgent = req.headers["user-agent"] || "";
+    try {
+        const { status, body } = await connexionParCode({ code, deviceId, ip, userAgent, mac });
+        return res.status(status).json(body);
+    } catch (err) {
+        console.error("Erreur login-code:", err.message);
+        return res.status(500).json({ success: false, message: "Erreur serveur." });
+    }
 });
 
 app.post("/api/login", async (req, res) => {
-    const { ticket, forfaitId } = req.body;
+    const { ticket, deviceId, mac } = req.body;
     if (!ticket) return res.status(400).json({ success: false, message: "Veuillez entrer un code ticket." });
     const ip = req.ip || "inconnu";
     const userAgent = req.headers["user-agent"] || "";
-    const bloque = await pool.query("SELECT 1 FROM blacklist WHERE type = 'ip' AND valeur = $1", [ip]);
-    if (bloque.rowCount > 0) return res.status(403).json({ success: false, message: "Accès refusé." });
-
-    // Vérifier que le ticket existe et est disponible
-    const tRes = await pool.query(
-        "SELECT * FROM tickets WHERE code = $1 AND statut = 'disponible'",
-        [ticket.trim().toUpperCase()]
-    );
-    if (tRes.rowCount === 0) {
-        await ajouterLog("connexion", `Tentative de connexion avec code invalide/inutilisé: ${ticket.trim().toUpperCase()} — IP: ${ip}`);
-        return res.status(401).json({ success: false, message: "Code ticket invalide ou déjà utilisé." });
-    }
-    const ticketRow = mapRow(tRes.rows[0]);
-
-    let forfait;
-    if (forfaitId) {
-        const r = await pool.query("SELECT * FROM forfaits WHERE id = $1 AND statut = 'actif'", [parseInt(forfaitId)]);
-        forfait = mapRow(r.rows[0]);
-    } else {
-        const r = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticketRow.forfaitId]);
-        forfait = mapRow(r.rows[0]);
-    }
-    if (!forfait) return res.status(404).json({ success: false, message: "Aucun forfait actif disponible." });
-
-    // Marquer le ticket comme utilisé
-    await pool.query("UPDATE tickets SET statut = 'utilise' WHERE id = $1", [ticketRow.id]);
-
-    await pool.query(
-        "INSERT INTO connexions (ticket, ip, forfait, montant) VALUES ($1, $2, $3, $4)",
-        [ticket.trim().toUpperCase(), ip, forfait.nom, forfait.prix]
-    );
-
-    // Enregistrer le client connecté
     try {
-        await pool.query(
-            "INSERT INTO clients (ip, forfait, debut, statut) VALUES ($1, $2, now(), 'connecte') ON CONFLICT DO NOTHING",
-            [ip, forfait.nom]
-        );
-    } catch {}
-
-    // Activer l'appareil sur Mikrotik
-    let mikrotikOk = false;
-    if (mk.MIKROTIK_ENABLED) {
-        try {
-            const mkResult = await mk.creerUtilisateurHotspot(ticketRow.code, forfait.profilMikrotik || forfait.nom, forfait.duree);
-            mikrotikOk = mkResult.success;
-            if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticketRow.code}" activé — profil ${forfait.profilMikrotik || forfait.nom}`);
-        } catch (e) {
-            console.error("Mikrotik login error:", e.message);
-        }
+        const { status, body } = await connexionParCode({ code: ticket, deviceId, ip, userAgent, mac });
+        return res.status(status).json(body);
+    } catch (err) {
+        console.error("Erreur login:", err.message);
+        return res.status(500).json({ success: false, message: "Erreur serveur." });
     }
-
-    await ajouterLog("connexion", `Client ${ip} connecté — ${forfait.nom}${mikrotikOk ? " [MK OK]" : ""}`);
-    return res.json({
-        success: true,
-        message: "Connexion réussie !",
-        forfait: forfait.nom,
-        quota: forfait.quota,
-        debit: forfait.debit,
-        duree: forfait.duree,
-        mikrotik: mikrotikOk
-    });
 });
 
 // ─────────────────────────────────────────
@@ -860,8 +955,60 @@ app.delete("/api/admin/hotspots/:id", adminAuth, async (req, res) => {
 // ─────────────────────────────────────────
 
 app.get("/api/admin/clients", adminAuth, async (req, res) => {
-    const { rows } = await pool.query("SELECT * FROM clients ORDER BY id");
-    res.json({ success: true, clients: mapRows(rows) });
+    const resultats = [];
+    try {
+        if (mk.MIKROTIK_ENABLED) {
+            const actifs = await mk.listerClientsActifs();
+            for (const c of (actifs.data || [])) {
+                const total = (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
+                resultats.push({
+                    ip: c.address,
+                    mac: c["mac-address"] || null,
+                    forfait: c.user || null,
+                    hotspot: c.server || null,
+                    debut: new Date(Date.now() - uptimeToSecondes(c.uptime) * 1000).toISOString(),
+                    quotaConsomme: octetsLisible(total),
+                    debit: null,
+                    statut: "connecte",
+                    source: "mikrotik"
+                });
+            }
+        }
+    } catch (e) {
+        console.error("Mikrotik clients merge error:", e.message);
+    }
+    const { rows } = await pool.query("SELECT * FROM clients WHERE statut = 'connecte'");
+    const dbMapped = mapRows(rows);
+    const liveIps = new Set(resultats.map(x => x.ip));
+    for (const d of dbMapped) {
+        d.source = "db";
+        if (liveIps.has(d.ip)) {
+            const live = resultats.find(x => x.ip === d.ip);
+            live.forfait = d.forfait || live.forfait;
+        } else {
+            resultats.push(d);
+        }
+    }
+    const codes = resultats.map(x => (x.source === "mikrotik" ? x.forfait : null)).filter(Boolean);
+    if (codes.length > 0) {
+        const t = await pool.query(
+            "SELECT t.code, f.nom, f.debit, f.quota, f.duree FROM tickets t JOIN forfaits f ON f.id = t.forfait_id WHERE t.code = ANY($1)",
+            [codes]
+        );
+        const map = Object.fromEntries(t.rows.map(r => [r.code, { nom: r.nom, debit: r.debit, quota: r.quota, duree: r.duree }]));
+        for (const x of resultats) {
+            if (x.source !== "mikrotik") continue;
+            const info = map[x.forfait];
+            if (info) {
+                x.forfait = info.nom;
+                x.debit = info.debit;
+                x.duree = info.duree;
+                if (x.quotaConsomme && info.quota) x.quotaConsomme = `${x.quotaConsomme} / ${info.quota}`;
+            }
+        }
+    }
+    resultats.sort((a, b) => new Date(b.debut) - new Date(a.debut));
+    res.json({ success: true, clients: resultats });
 });
 
 app.delete("/api/admin/clients/:id", adminAuth, async (req, res) => {
@@ -1240,30 +1387,33 @@ app.get("/api/admin/mikrotik/test", adminAuth, async (req, res) => {
     res.json(result);
 });
 
-// Statut Mikrotik
-app.get("/api/admin/mikrotik/statut", adminAuth, (req, res) => {
+// Statut Mikrotik (test réel de connexion)
+app.get("/api/admin/mikrotik/statut", adminAuth, async (req, res) => {
+    const test = await mk.testerConnexion();
     res.json({
         success: true,
         enabled: mk.MIKROTIK_ENABLED,
-        host: process.env.MIKROTIK_HOST || "192.168.88.1",
+        connecte: test.success,
+        ip: process.env.MIKROTIK_HOST || "192.168.88.1",
         port: process.env.MIKROTIK_PORT || "8728",
         user: process.env.MIKROTIK_USER || "admin",
-        message: mk.MIKROTIK_ENABLED
-            ? "Mikrotik activé — synchronisation automatique active"
-            : "Mikrotik désactivé — mettre MIKROTIK_ENABLED=true dans .env pour activer"
+        message: test.success
+            ? "Mikrotik connecté — synchronisation automatique active"
+            : (test.message || "Mikrotik désactivé — mettre MIKROTIK_ENABLED=true dans .env pour activer"),
+        erreur: test.success ? null : (test.message || null)
     });
 });
 
 // Lister les profils Mikrotik
 app.get("/api/admin/mikrotik/profils", adminAuth, async (req, res) => {
     const result = await mk.listerProfils();
-    res.json(result);
+    res.json({ ...result, profils: result.data || [] });
 });
 
 // Lister les clients actifs sur Mikrotik
 app.get("/api/admin/mikrotik/clients", adminAuth, async (req, res) => {
     const result = await mk.listerClientsActifs();
-    res.json(result);
+    res.json({ ...result, clients: result.data || [] });
 });
 
 // Synchroniser tous les forfaits vers Mikrotik
@@ -1899,6 +2049,54 @@ async function verifierExpirations() {
 
 // Vérifier les expirations toutes les 5 minutes
 setInterval(verifierExpirations, 5 * 60 * 1000);
+
+// ─────────────────────────────────────────
+// LIAISON / CONTRÔLE MAC (un seul appareil par ticket)
+// Chaque ticket est lié à la première adresse MAC qui l'utilise. Ensuite,
+// l'utilisateur hotspot Mikrotik est verrouillé sur cette MAC et toute session
+// active provenant d'une autre MAC est immédiatement coupée.
+// ─────────────────────────────────────────
+
+let _macEnCours = false;
+
+async function verifierMacSessions() {
+    if (!mk.MIKROTIK_ENABLED || _macEnCours) return;
+    _macEnCours = true;
+    try {
+        const res = await mk.listerClientsActifs();
+        if (!res.success || !Array.isArray(res.data)) return;
+
+        for (const s of res.data) {
+            const user = s.user;
+            const mac = s["mac-address"] ? s["mac-address"].trim().toUpperCase() : null;
+            const id = s[".id"];
+            if (!user || !mac) continue;
+
+            const tRes = await pool.query("SELECT id, mac FROM tickets WHERE code = $1", [user]);
+            if (tRes.rows.length === 0) continue;
+            const ticket = tRes.rows[0];
+            const ticketMac = ticket.mac ? ticket.mac.trim().toUpperCase() : null;
+
+            if (!ticketMac) {
+                // Premier appareil détecté → liaison définitive
+                await pool.query("UPDATE tickets SET mac = $1 WHERE id = $2", [mac, ticket.id]);
+                await mk.definirMacUtilisateurHotspot(user, mac);
+                await ajouterLog("mikrotik", `Ticket ${user} lié à l'appareil ${mac}`);
+            } else if (ticketMac !== mac) {
+                // Appareil non autorisé → coupure immédiate de la session
+                await mk.retirerSessionActiveParId(id);
+                await ajouterLog("connexion", `Session ${user} coupée — appareil ${mac} non autorisé (lié à ${ticketMac})`);
+            }
+        }
+    } catch (e) {
+        console.error("Erreur verifierMacSessions:", e.message);
+    } finally {
+        _macEnCours = false;
+    }
+}
+
+// Contrôle des sessions MAC toutes les 8 secondes
+setInterval(verifierMacSessions, 8 * 1000);
 
 // ─────────────────────────────────────────
 // FALLBACK SPA (React Router)

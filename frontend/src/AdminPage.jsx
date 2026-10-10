@@ -9,6 +9,32 @@ import {
 } from "lucide-react";
 import "./AdminPage.css";
 
+// ─── Déconnexion automatique sur session expirée ───────────────────────────
+let onSessionExpire = null;
+
+function decodageJwt(token) {
+  try {
+    const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(payload);
+    const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch { return null; }
+}
+
+axios.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (
+      err.response?.status === 401 &&
+      err.config?.url?.startsWith("/api/admin") &&
+      !err.config.url.includes("/api/admin/login")
+    ) {
+      if (onSessionExpire) onSessionExpire(true);
+    }
+    return Promise.reject(err);
+  }
+);
+
 // ─── Utilitaires ───────────────────────────────────────────────────────────
 function useSearch(items, keys) {
   const [query, setQuery] = useState("");
@@ -684,13 +710,20 @@ function Clients({ token }) {
   const showMsg = (text, type = "success") => { setMsg({ text, type }); setTimeout(() => setMsg({ text: "", type: "" }), 3000); };
   const charger = () => axios.get("/api/admin/clients", { headers: { Authorization: `Bearer ${token}` } }).then(r => setClients(r.data.clients)).catch(() => {});
   useEffect(() => { charger(); const t = setInterval(charger, 10000); return () => clearInterval(t); }, []);
-  const handleDeconnecter = async (id, ip) => {
-    if (!window.confirm(`Déconnecter le client ${ip} ?`)) return;
-    try { await axios.delete(`/api/admin/clients/${id}`, { headers: { Authorization: `Bearer ${token}` } }); showMsg(`Client ${ip} déconnecté.`); charger(); }
+  const handleDeconnecter = async (c) => {
+    if (!window.confirm(`Déconnecter le client ${c.ip} ?`)) return;
+    const hdrs = { Authorization: `Bearer ${token}` };
+    try {
+      if (c.id && c.source !== "mikrotik") await axios.delete(`/api/admin/clients/${c.id}`, { headers: hdrs });
+      if (c.source === "mikrotik" && c.ip) await axios.delete(`/api/admin/mikrotik/clients/${c.ip}`, { headers: hdrs });
+      showMsg(`Client ${c.ip} déconnecté.`); charger();
+    }
     catch { showMsg("Erreur.", "error"); }
   };
   const duree = (debut) => {
+    if (!debut) return "—";
     const diff = Math.floor((Date.now() - new Date(debut)) / 1000);
+    if (diff < 0) return "0min";
     const h = Math.floor(diff / 3600), m = Math.floor((diff % 3600) / 60);
     return h > 0 ? `${h}h ${m}min` : `${m}min`;
   };
@@ -706,15 +739,15 @@ function Clients({ token }) {
         <div className="table-wrapper"><table>
           <thead><tr><th>IP</th><th>MAC</th><th>Forfait</th><th>Hotspot</th><th>Connecté depuis</th><th>Quota consommé</th><th>Débit</th><th>Actions</th></tr></thead>
           <tbody>{clients.length === 0 ? <tr><td colSpan="8" className="empty-msg">Aucun client connecté.</td></tr> : clients.map(c => (
-            <tr key={c.id}>
+            <tr key={c.id || c.ip}>
               <td className="code-cell">{c.ip}</td>
               <td style={{ fontFamily: "monospace", fontSize: "12px" }}>{c.mac}</td>
               <td><span className="badge blue">{c.forfait}</span></td>
               <td>{c.hotspot}</td>
-              <td><span className="badge green">{duree(c.debut)}</span></td>
+              <td><span className="badge green">{duree(c.debut)}{c.duree ? ` / ${c.duree}` : ""}</span></td>
               <td>{c.quotaConsomme}</td>
               <td>{c.debit}</td>
-              <td className="actions-cell"><button className="btn-supprimer" onClick={() => handleDeconnecter(c.id, c.ip)}>Déconnecter</button></td>
+              <td className="actions-cell"><button className="btn-supprimer" onClick={() => handleDeconnecter(c)}>Déconnecter</button></td>
             </tr>
           ))}</tbody>
         </table></div>
@@ -1354,7 +1387,11 @@ function Mikrotik({ token }) {
   const chargerProfils = async () => { try { const r = await axios.get("/api/admin/mikrotik/profils", hdr); setProfils(r.data.profils || []); } catch {} };
   const chargerClients = async () => { try { const r = await axios.get("/api/admin/mikrotik/clients", hdr); setClients(r.data.clients || []); } catch {} };
 
-  useEffect(() => { chargerStatut(); chargerProfils(); chargerClients(); }, []);
+  useEffect(() => {
+    chargerStatut(); chargerProfils(); chargerClients();
+    const i = setInterval(() => { chargerStatut(); chargerProfils(); chargerClients(); }, 15000);
+    return () => clearInterval(i);
+  }, []);
 
   const handleTest = async () => {
     try { const r = await axios.get("/api/admin/mikrotik/test", hdr); showMsg(r.data.message, r.data.success ? "success" : "error"); chargerStatut(); }
@@ -1411,7 +1448,7 @@ function Mikrotik({ token }) {
           <div className="table-wrapper"><table>
             <thead><tr><th>Nom</th><th>Débit</th><th>Quota</th></tr></thead>
             <tbody>{profils.map((p, i) => (
-              <tr key={i}><td><strong>{p.name || p.nom || "—"}</strong></td><td>{p.rateLimit || p.debit || "—"}</td><td>{p.quota || "Illimité"}</td></tr>
+              <tr key={i}><td><strong>{p.name || p.nom || "—"}</strong></td><td>{p["rate-limit"] || p.rateLimit || p.debit || "—"}</td><td>{p.quota || "Illimité"}</td></tr>
             ))}</tbody>
           </table></div>
         </div>
@@ -1719,6 +1756,15 @@ function AdminPage() {
     localStorage.setItem("smd_admin_onglet", id);
   };
 
+  const forcerDeconnexion = (message) => {
+    localStorage.removeItem("smd_admin_token");
+    delete axios.defaults.headers.common["Authorization"];
+    setToken("");
+    setConnecte(false);
+    changerOnglet("dashboard");
+    if (message) setLoginError(message);
+  };
+
   // Restaurer le token au chargement
   useEffect(() => {
     if (token) {
@@ -1726,6 +1772,22 @@ function AdminPage() {
       setConnecte(true);
     }
   }, []);
+
+  // Intercepteur : déconnexion automatique si le serveur répond 401 (session expirée)
+  useEffect(() => {
+    onSessionExpire = (via401) => forcerDeconnexion(via401 ? "Session expirée. Veuillez vous reconnecter." : "");
+    return () => { onSessionExpire = null; };
+  }, []);
+
+  // Minuteur : déconnexion automatique à la date d'expiration du token (même si inactif)
+  useEffect(() => {
+    if (!token) return;
+    const info = decodageJwt(token);
+    if (!info?.exp) return;
+    const restantMs = info.exp * 1000 - Date.now();
+    const timer = setTimeout(() => onSessionExpire?.(false), Math.max(0, restantMs));
+    return () => clearTimeout(timer);
+  }, [token]);
 
   const handleLogin = async (e) => {
     e.preventDefault(); setLoginError("");

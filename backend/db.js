@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     telephone        VARCHAR(30),
     operateur        VARCHAR(30),
     appareil_id      TEXT,
+    mac              VARCHAR(20),
     gratuit          BOOLEAN NOT NULL DEFAULT false,
     campay_reference VARCHAR(100) UNIQUE,
     date_creation    TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -196,6 +197,7 @@ async function initSchema() {
     await pool.query(SCHEMA_SQL);
     // Migrations pour colonnes ajoutées après la création initiale
     await pool.query(`ALTER TABLE parametres ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+    await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS mac VARCHAR(20)`);
 }
 
 async function initDb() {

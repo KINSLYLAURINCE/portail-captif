@@ -15,6 +15,19 @@ function getDeviceId() {
   return id;
 }
 
+// ─── Récupérer l'adresse MAC (fournie par le routeur via l'URL) ────────────
+function getMac() {
+  let mac = localStorage.getItem("smd_mac");
+  try {
+    const param = new URLSearchParams(window.location.search).get("mac");
+    if (param) {
+      mac = param.trim().toUpperCase();
+      localStorage.setItem("smd_mac", mac);
+    }
+  } catch {}
+  return mac || null;
+}
+
 // ─── Sauvegarder / récupérer le dernier ticket ────────────────────────────
 function sauvegarderTicket(ticket, forfait) {
   localStorage.setItem("smd_last_ticket", JSON.stringify({ ticket, forfait, date: new Date().toISOString() }));
@@ -31,6 +44,16 @@ function recupererDernierTicket() {
     }
     return data;
   } catch { return null; }
+}
+
+// ─── Formatage du temps restant (ex: 95 → "1h 35min") ─────────────────────
+function fmtTemps(sec) {
+  if (sec === null || sec === undefined) return "Illimité";
+  if (sec <= 0) return "0 min";
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.ceil((sec % 3600) / 60);
+  if (d > 0) return `${d}j ${h}h`;
+  if (h > 0) return `${h}h ${m}min`;
+  return `${m}min`;
 }
 
 // ─── Connexion automatique au portail captif Mikrotik (HTTP PAP) ──────────
@@ -183,6 +206,9 @@ const LANGS = {
     navTickets: "Tickets",
     navForfaits: "Forfaits",
     navMonCode: "Mon code",
+    codePrefill: "Votre code a été rempli automatiquement",
+    tempsRestant: "Temps restant",
+    dejaConnecte: "déjà connecté",
   },
   en: {
     bienvenue: "Welcome to our Wi-Fi network",
@@ -255,6 +281,9 @@ const LANGS = {
     navTickets: "Tickets",
     navForfaits: "Plans",
     navMonCode: "My code",
+    codePrefill: "Your code has been filled in automatically",
+    tempsRestant: "Time left",
+    dejaConnecte: "already connected",
   }
 };
 
@@ -325,7 +354,7 @@ function PageAccueil({ lang, setLang }) {
 
         {/* Reprendre dernier ticket */}
         {dernierTicket && (
-          <button className="btn-resume" onClick={() => navigate(`/tickets/${dernierTicket.ticket?.code}`)}>
+          <button className="btn-resume" onClick={() => navigate("/code")}>
             🔄 {t.dernierTicket} — <strong>{dernierTicket.forfait?.nom}</strong>
           </button>
         )}
@@ -373,6 +402,30 @@ function PageCodeExistant({ lang, setLang }) {
   const [connecte, setConnecte] = useState(false);
   const [countdown, setCountdown] = useState(5);
   const [forfaitInfo, setForfaitInfo] = useState(null);
+  const [autoInfo, setAutoInfo] = useState(null);
+
+  // Pré-remplir automatiquement le code si le dernier ticket est encore valide
+  useEffect(() => {
+    const verifier = (c) => {
+      if (!c) return;
+      axios.get(`/api/ticket-etat/${encodeURIComponent(c)}`, { params: { deviceId: getDeviceId() } })
+        .then(r => {
+          if (r.data.valide && r.data.memeAppareil !== false) {
+            setCode(c);
+            setAutoInfo(r.data);
+          }
+        })
+        .catch(() => {});
+    };
+    const dernier = recupererDernierTicket()?.ticket?.code;
+    if (dernier) {
+      verifier(dernier);
+    } else {
+      axios.get("/api/session", { params: { deviceId: getDeviceId() } })
+        .then(r => { if (r.data?.success && r.data.connecte && r.data.ticket) verifier(r.data.ticket); })
+        .catch(() => {});
+    }
+  }, []);
 
   useEffect(() => {
     if (connecte) {
@@ -405,7 +458,7 @@ function PageCodeExistant({ lang, setLang }) {
     setMessage("");
     try {
       const deviceId = getDeviceId();
-      const response = await axios.post("/api/login-code", { code: code.trim().toUpperCase(), deviceId });
+      const response = await axios.post("/api/login-code", { code: code.trim().toUpperCase(), deviceId, mac: getMac() });
       setForfaitInfo({
         nom: response.data.forfait,
         quota: response.data.quota,
@@ -430,6 +483,11 @@ function PageCodeExistant({ lang, setLang }) {
 
         {!connecte ? (
           <form onSubmit={handleConnecter}>
+            {autoInfo && (
+              <div className="message success">
+                🔁 {t.codePrefill} : <strong>{code}</strong> — {t.tempsRestant} : <strong>{fmtTemps(autoInfo.secondesRestantes)}</strong>{autoInfo.actif ? ` · ${t.dejaConnecte}` : ""}
+              </div>
+            )}
             <div className="form-field">
               <label>{t.votreCode}</label>
               <input
@@ -1051,7 +1109,7 @@ function PageTicket({ lang, setLang }) {
     setLoading(true);
     setMessage("");
     try {
-      const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId });
+      const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId, deviceId: getDeviceId(), mac: getMac() });
       setForfaitInfo({
         nom: response.data.forfait,
         quota: response.data.quota,
