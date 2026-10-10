@@ -373,7 +373,7 @@ app.get("/api/ticket-etat/:code", rateLimit(30, 60000), async (req, res) => {
         } else if (ticket.statut === "utilise") {
             const info = await mk.informationsUtilisateurHotspot(code);
             if (info.existe) {
-                valide = info.restant !== 0;
+                valide = info.restant !== 0 && !info.quotaEpuise;
                 actif = !!info.actif;
                 secondesRestantes = info.restant;
                 if (!valide) raison = "expire";
@@ -560,6 +560,9 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
             if (!info.existe || info.restant === 0) {
                 return { status: 403, body: { success: false, message: "Ce code a expiré (temps de forfait écoulé)." } };
             }
+            if (info.quotaEpuise) {
+                return { status: 403, body: { success: false, message: "Ce code a expiré (quota de données atteint)." } };
+            }
             restant = info.restant;
         } else {
             const fRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
@@ -615,7 +618,7 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     let mikrotikOk = false;
     if (mk.MIKROTIK_ENABLED && !reconnexion) {
         try {
-            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, mac);
+            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, mac, forfait.quota);
             mikrotikOk = mkResult.success;
             if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code${mac ? ` (MAC ${mac})` : ""}`);
         } catch (e) {
@@ -1516,14 +1519,14 @@ app.post("/api/admin/mikrotik/sync-forfaits", adminAuth, async (req, res) => {
 // Synchroniser tous les tickets disponibles vers Mikrotik
 app.post("/api/admin/mikrotik/sync-tickets", adminAuth, async (req, res) => {
     const { rows } = await pool.query(`
-        SELECT t.code, f.profil_mikrotik, f.nom, f.duree
+        SELECT t.code, f.profil_mikrotik, f.nom, f.duree, f.quota
         FROM tickets t JOIN forfaits f ON f.id = t.forfait_id
         WHERE t.statut = 'disponible'
         ORDER BY t.id
     `);
     const results = [];
     for (const row of rows) {
-        const r = await mk.creerUtilisateurHotspot(row.code, row.profil_mikrotik || row.nom, row.duree);
+        const r = await mk.creerUtilisateurHotspot(row.code, row.profil_mikrotik || row.nom, row.duree, null, row.quota);
         results.push({ code: row.code, ...r });
     }
     const success = results.filter(r => r.success).length;

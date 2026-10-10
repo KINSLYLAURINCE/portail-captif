@@ -257,38 +257,24 @@ async function supprimerProfilHotspot(nom) {
 }
 
 /**
- * Créer un utilisateur Hotspot (ticket) sur Mikrotik
+ * Convertit un quota texte ("500 Mo", "1 Go", "2 GB", "Illimité") en octets.
+ * Retourne null quand il n'y a pas de limite (Illimité / 0 / vide / invalide).
  */
-async function creerUtilisateurHotspot(code, profilNom, duree) {
-    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
-    try {
-        // Convertir la durée en format Mikrotik (ex: "1 heure" → "01:00:00")
-        const dureeMap = {
-            "30 minutes": "00:30:00",
-            "1 heure":    "01:00:00",
-            "2 heures":   "02:00:00",
-            "3 heures":   "03:00:00",
-            "6 heures":   "06:00:00",
-            "12 heures":  "12:00:00",
-            "24 heures":  "1d",
-            "3 jours":    "3d",
-            "7 jours":    "7d",
-            "30 jours":   "30d",
-            "Illimité":   "0s",
-        };
-        const dureesMK = dureeMap[duree] || "01:00:00";
-
-        await mikrotikCommand([
-            "/ip/hotspot/user/add",
-            `=name=${code}`,
-            `=password=${code}`,
-            `=profile=${profilNom}`,
-            `=limit-uptime=${dureesMK}`,
-        ]);
-        return { success: true, message: `Utilisateur "${code}" créé sur Mikrotik` };
-    } catch (err) {
-        return { success: false, message: `Erreur Mikrotik: ${err.message}` };
-    }
+function quotaEnOctets(quota) {
+    if (!quota) return null;
+    const q = String(quota).trim().toLowerCase();
+    if (q === "" || q === "0" || q.includes("illimit")) return null;
+    const m = q.match(/^([\d]+(?:[.,]\d+)?)\s*(ko|kb|mo|mb|go|gb|to|tb|k|m|g|t)?/);
+    if (!m) return null;
+    const val = parseFloat(m[1].replace(",", "."));
+    if (!isFinite(val) || val <= 0) return null;
+    const mult = {
+        ko: 1024,         k: 1024,         kb: 1024,
+        mo: 1024 ** 2,    m: 1024 ** 2,    mb: 1024 ** 2,
+        go: 1024 ** 3,    g: 1024 ** 3,    gb: 1024 ** 3,
+        to: 1024 ** 4,    t: 1024 ** 4,    tb: 1024 ** 4,
+    }[m[2] || "mo"] || 1024 ** 2;
+    return Math.round(val * mult);
 }
 
 /**
@@ -316,7 +302,7 @@ function normaliserMac(mac) {
     return mac.trim().toUpperCase().replace(/-/g, ":");
 }
 
-async function creerUtilisateurHotspot(code, profilNom, duree, mac) {
+async function creerUtilisateurHotspot(code, profilNom, duree, mac, quota) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
         // Convertir la durée en format Mikrotik (ex: "1 heure" → "01:00:00")
@@ -346,8 +332,16 @@ async function creerUtilisateurHotspot(code, profilNom, duree, mac) {
         const macMK = normaliserMac(mac);
         if (macMK) words.push(`=mac-address=${macMK}`);
 
+        // Limiter le volume total (ex: 500 Mo). RouterOS coupe l'abonné dès
+        // que quota_in + quota_out atteint cette valeur, même après reconnexion.
+        const quotaOctets = quotaEnOctets(quota);
+        if (quotaOctets) words.push(`=limit-bytes-total=${quotaOctets}`);
+
         await mikrotikCommand(words);
-        return { success: true, message: `Utilisateur "${code}" créé sur Mikrotik${macMK ? ` (MAC ${macMK})` : ""}` };
+        return {
+            success: true,
+            message: `Utilisateur "${code}" créé sur Mikrotik${macMK ? ` (MAC ${macMK})` : ""}${quotaOctets ? ` (quota ${quota})` : ""}`,
+        };
     } catch (err) {
         return { success: false, message: `Erreur Mikrotik: ${err.message}` };
     }
@@ -408,7 +402,12 @@ async function informationsUtilisateurHotspot(code) {
             const stl = parseTempsSec(actifs.data[0]["session-time-left"]);
             if (stl > 0) restant = stl;
         }
-        return { success: true, existe: true, actif, restant, limite, utilise };
+        // Quota volume : cumul RouterOS (bytes-in + bytes-out) vs limit-bytes-total
+        const quotaTotal = parseInt(u["limit-bytes-total"]) || 0;
+        const quotaUtilise = (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0);
+        const quotaRestant = quotaTotal > 0 ? Math.max(0, quotaTotal - quotaUtilise) : null;
+        const quotaEpuise = quotaTotal > 0 && quotaUtilise >= quotaTotal;
+        return { success: true, existe: true, actif, restant, quotaTotal, quotaUtilise, quotaRestant, quotaEpuise };
     } catch (err) {
         return { success: false, message: err.message, existe: false, actif: false, restant: 0 };
     }
