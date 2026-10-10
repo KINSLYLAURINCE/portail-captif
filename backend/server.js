@@ -712,8 +712,8 @@ app.get("/api/admin/dashboard", adminAuth, async (req, res) => {
             (SELECT COUNT(*)::int FROM domiciles)                                         AS total_domiciles,
             (SELECT COUNT(*)::int FROM domiciles WHERE statut = 'actif')                  AS domiciles_actifs,
             (SELECT COUNT(*)::int FROM connexions)                                        AS total_connexions,
-            (SELECT COALESCE(SUM(montant), 0)::int FROM connexions)                       AS recette_total,
-            (SELECT COALESCE(SUM(montant), 0)::int FROM connexions WHERE debut::date = $1::date) AS recette_aujourdhui
+            (SELECT COALESCE(SUM(prix), 0)::int FROM tickets WHERE gratuit = false AND campay_reference IS NOT NULL) AS recette_total,
+            (SELECT COALESCE(SUM(prix), 0)::int FROM tickets WHERE gratuit = false AND campay_reference IS NOT NULL AND date_creation::date = $1::date) AS recette_aujourdhui
     `, [today]);
 
     const s = rows[0];
@@ -1190,20 +1190,15 @@ app.put("/api/admin/parametres/password", adminAuth, async (req, res) => {
 
 app.get("/api/admin/stats", adminAuth, async (req, res) => {
     const parJourRows = await pool.query(`
-        SELECT debut::date::text AS date, COUNT(*)::int AS connexions, COALESCE(SUM(montant), 0)::int AS recette
-        FROM connexions
-        WHERE debut >= (CURRENT_DATE - INTERVAL '6 days')
-        GROUP BY 1
+        SELECT d.jour::date::text AS date,
+               (SELECT COUNT(*)::int FROM connexions c WHERE c.debut::date = d.jour::date) AS connexions,
+               (SELECT COALESCE(SUM(t.prix), 0)::int FROM tickets t
+                  WHERE t.date_creation::date = d.jour::date
+                    AND t.gratuit = false AND t.campay_reference IS NOT NULL) AS recette
+        FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') AS d(jour)
+        ORDER BY 1
     `);
-    const parJourMap = Object.fromEntries(parJourRows.rows.map(r => [r.date, r]));
-    const parJour = [];
-    for (let i = 6; i >= 0; i--) {
-        const date = new Date();
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().slice(0, 10);
-        const found = parJourMap[dateStr];
-        parJour.push({ date: dateStr, connexions: found?.connexions || 0, recette: found?.recette || 0 });
-    }
+    const parJour = parJourRows.rows;
 
     const parForfaitRows = await pool.query(
         "SELECT forfait, COUNT(*)::int AS n FROM connexions WHERE forfait IS NOT NULL GROUP BY forfait"
@@ -1225,21 +1220,22 @@ app.get("/api/admin/comptabilite", adminAuth, async (req, res) => {
 
     const totaux = (await pool.query(`
         SELECT
-            COALESCE(SUM(montant), 0)::int AS recette_total,
-            COALESCE(SUM(CASE WHEN debut::date = $1::date THEN montant ELSE 0 END), 0)::int AS recette_aujourdhui
-        FROM connexions
+            COALESCE(SUM(prix), 0)::int AS recette_total,
+            COALESCE(SUM(CASE WHEN date_creation::date = $1::date THEN prix ELSE 0 END), 0)::int AS recette_aujourdhui
+        FROM tickets
+        WHERE gratuit = false AND campay_reference IS NOT NULL
     `, [today])).rows[0];
 
     const parMoisRows = await pool.query(`
-        SELECT to_char(debut, 'YYYY-MM') AS mois, COALESCE(SUM(montant), 0)::int AS total
-        FROM connexions WHERE debut IS NOT NULL GROUP BY 1
+        SELECT to_char(date_creation, 'YYYY-MM') AS mois, COALESCE(SUM(prix), 0)::int AS total
+        FROM tickets WHERE gratuit = false AND campay_reference IS NOT NULL AND date_creation IS NOT NULL GROUP BY 1
     `);
     const parMois = {};
     parMoisRows.rows.forEach(r => { parMois[r.mois] = r.total; });
 
     const parForfaitRows = await pool.query(`
-        SELECT forfait, COALESCE(SUM(montant), 0)::int AS total
-        FROM connexions WHERE forfait IS NOT NULL GROUP BY forfait
+        SELECT forfait_nom AS forfait, COALESCE(SUM(prix), 0)::int AS total
+        FROM tickets WHERE gratuit = false AND campay_reference IS NOT NULL AND forfait_nom IS NOT NULL GROUP BY 1
     `);
     const parForfait = {};
     parForfaitRows.rows.forEach(r => { parForfait[r.forfait] = r.total; });
@@ -1305,50 +1301,59 @@ app.get("/api/admin/finances", adminAuth, async (req, res) => {
     const tickets = ticketsRows.rows.map(mapRow);
 
     // ── Totaux
+    // La recette RÉELLE = uniquement les paiements confirmés Fapshi, c.-à-d. les
+    // tickets payants possédant une référence de paiement (campay_reference).
+    // Les tickets sans référence (créés manuellement / hors paiement) ne sont
+    // pas comptés comme de l'argent encaissé.
+    const PAYE = `gratuit = false AND campay_reference IS NOT NULL`;
+    const NONPAYE = `gratuit = false AND campay_reference IS NULL`;
+
     const totauxRows = await pool.query(`
         SELECT
             COUNT(*)::int AS total_tickets,
-            COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette_payante,
+            COALESCE(SUM(CASE WHEN ${PAYE} THEN prix ELSE 0 END), 0)::int AS recette_payante,
+            COALESCE(SUM(CASE WHEN ${NONPAYE} THEN prix ELSE 0 END), 0)::int AS recette_non_payee,
             COALESCE(SUM(CASE WHEN gratuit = true THEN prix ELSE 0 END), 0)::int AS recette_gratuite,
             COUNT(*) FILTER (WHERE gratuit = true)::int AS tickets_gratuits,
-            COUNT(*) FILTER (WHERE gratuit = false)::int AS tickets_payants,
+            COUNT(*) FILTER (WHERE ${PAYE})::int AS tickets_payants,
+            COUNT(*) FILTER (WHERE ${NONPAYE})::int AS tickets_non_payes,
             COUNT(*) FILTER (WHERE statut = 'utilise')::int AS tickets_utilises,
             COUNT(*) FILTER (WHERE statut = 'disponible')::int AS tickets_disponibles
         FROM tickets t
         ${where}
     `, params);
 
-    // ── Recettes par jour
+    // ── Recettes par jour (paiements confirmés uniquement)
     const parJourRows = await pool.query(`
         SELECT date_creation::date::text AS jour,
                COUNT(*)::int AS tickets,
-               COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette
+               COALESCE(SUM(CASE WHEN ${PAYE} THEN prix ELSE 0 END), 0)::int AS recette
         FROM tickets t
         ${where}
         GROUP BY 1 ORDER BY 1 DESC
     `, params);
 
-    // ── Recettes par forfait
+    // ── Recettes par forfait (paiements confirmés uniquement)
     const parForfaitRows = await pool.query(`
         SELECT COALESCE(forfait_nom, 'Inconnu') AS forfait,
                COUNT(*)::int AS tickets,
-               COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette
+               COALESCE(SUM(CASE WHEN ${PAYE} THEN prix ELSE 0 END), 0)::int AS recette
         FROM tickets t
         ${where}
         GROUP BY 1 ORDER BY recette DESC
     `, params);
 
-    // ── Recettes par opérateur
+    // ── Recettes par opérateur (paiements confirmés uniquement)
     const parOperateurRows = await pool.query(`
         SELECT COALESCE(NULLIF(operateur, ''), 'Inconnu') AS operateur,
                COUNT(*)::int AS tickets,
-               COALESCE(SUM(CASE WHEN gratuit = false THEN prix ELSE 0 END), 0)::int AS recette
+               COALESCE(SUM(CASE WHEN ${PAYE} THEN prix ELSE 0 END), 0)::int AS recette
         FROM tickets t
         ${where}
         GROUP BY 1 ORDER BY recette DESC
     `, params);
 
-    // ── Connexions facturées (source de vérité pour la recette réelle)
+    // ── Connexions facturées (référence des sessions)
     const connexionsRows = await pool.query(`
         SELECT c.id, c.ticket, c.ip, c.forfait, c.montant, c.debut, c.fin
         FROM connexions c
@@ -1356,15 +1361,19 @@ app.get("/api/admin/finances", adminAuth, async (req, res) => {
         LIMIT 500
     `);
 
-    const recetteReelle = connexionsRows.rows.reduce((sum, r) => sum + (r.montant || 0), 0);
+    const totaux = totauxRows.rows[0];
+    // Drapeau "payé" par ticket pour l'affichage
+    for (const tk of tickets) {
+        tk.paye = !tk.gratuit && !!tk.campayReference;
+    }
 
     res.json({
         success: true,
         tickets,
         totaux: {
-            ...totauxRows.rows[0],
-            recetteReelle,
-            totalEncaissable: totauxRows.rows[0].recette_payante
+            ...totaux,
+            recetteReelle: totaux.recette_payante,
+            totalEncaissable: totaux.recette_payante
         },
         parJour: parJourRows.rows,
         parForfait: parForfaitRows.rows,

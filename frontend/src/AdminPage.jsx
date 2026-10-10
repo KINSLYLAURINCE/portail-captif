@@ -1010,28 +1010,28 @@ function Finances({ token }) {
           <div className="stat-icon"><DollarSign size={24} /></div>
           <div className="stat-info">
             <div className="stat-value">{t.recette_payante?.toLocaleString() ?? 0} F</div>
-            <div className="stat-label">Recette Payante (tickets)</div>
+            <div className="stat-label">Encaissé réel (paiements Fapshi)</div>
           </div>
         </div>
         <div className="stat-card blue">
           <div className="stat-icon"><BarChart3 size={24} /></div>
           <div className="stat-info">
-            <div className="stat-value">{t.recetteReelle?.toLocaleString() ?? 0} F</div>
-            <div className="stat-label">Recette Réelle (connexions)</div>
+            <div className="stat-value">{t.recette_non_payee?.toLocaleString() ?? 0} F</div>
+            <div className="stat-label">Non encaissé (tickets non payés)</div>
           </div>
         </div>
         <div className="stat-card yellow">
           <div className="stat-icon"><Ticket size={24} /></div>
           <div className="stat-info">
             <div className="stat-value">{t.total_tickets ?? 0}</div>
-            <div className="stat-label">Tickets vendus</div>
+            <div className="stat-label">Tickets émis</div>
           </div>
         </div>
         <div className="stat-card purple">
           <div className="stat-icon"><Check size={24} /></div>
           <div className="stat-info">
             <div className="stat-value">{t.tickets_payants ?? 0}</div>
-            <div className="stat-label">Tickets payants</div>
+            <div className="stat-label">Tickets payants (Fapshi)</div>
           </div>
         </div>
         <div className="stat-card teal">
@@ -1058,8 +1058,8 @@ function Finances({ token }) {
         <div className="stat-card dark">
           <div className="stat-icon"><Clock size={24} /></div>
           <div className="stat-info">
-            <div className="stat-value">{(t.recette_gratuite ?? 0).toLocaleString()} F</div>
-            <div className="stat-label">Valeur gratuits (0 norm.)</div>
+            <div className="stat-value">{t.tickets_non_payes ?? 0}</div>
+            <div className="stat-label">Tickets non payés</div>
           </div>
         </div>
       </div>
@@ -1108,7 +1108,7 @@ function Finances({ token }) {
         <h3><><Clock size={16} /> Recettes par jour ({data.parJour.length})</></h3>
         {data.parJour.length === 0 ? <p className="empty-msg">Aucune donnée.</p> : (
           <div className="table-wrapper"><table>
-            <thead><tr><th>Date</th><th>Tickets</th><th>Recette</th></tr></thead>
+            <thead><tr><th>Date</th><th>Tickets</th><th>Encaissé (FCFA)</th></tr></thead>
             <tbody>{data.parJour.map((d, i) => (
               <tr key={i}>
                 <td>{new Date(d.jour + "T00:00:00").toLocaleDateString("fr-FR", { weekday: "short", day: "2-digit", month: "short", year: "numeric" })}</td>
@@ -1125,7 +1125,7 @@ function Finances({ token }) {
         <h3><><Package size={16} /> Recettes par forfait</></h3>
         {data.parForfait.length === 0 ? <p className="empty-msg">Aucune donnée.</p> : (
           <div className="table-wrapper"><table>
-            <thead><tr><th>Forfait</th><th>Tickets</th><th>Recette</th></tr></thead>
+            <thead><tr><th>Forfait</th><th>Tickets</th><th>Encaissé (FCFA)</th></tr></thead>
             <tbody>{data.parForfait.map((f, i) => (
               <tr key={i}>
                 <td><span className="badge blue">{f.forfait}</span></td>
@@ -1142,7 +1142,7 @@ function Finances({ token }) {
         <div className="admin-section">
           <h3><><Users size={16} /> Recettes par opérateur / mode de paiement</></h3>
           <div className="table-wrapper"><table>
-            <thead><tr><th>Mode</th><th>Tickets</th><th>Recette</th></tr></thead>
+            <thead><tr><th>Mode</th><th>Tickets</th><th>Encaissé (FCFA)</th></tr></thead>
             <tbody>{data.parOperateur.map((o, i) => (
               <tr key={i}>
                 <td><span className={`badge ${o.operateur === "Orange Money" ? "orange" : o.operateur === "MTN MoMo" ? "yellow" : "dark"}`}>{o.operateur}</span></td>
@@ -1183,8 +1183,8 @@ function Finances({ token }) {
                   <td><span className="badge blue">{tk.forfait_nom || "—"}</span></td>
                   <td><span className="badge green">{(tk.prix || 0).toLocaleString()} FCFA</span></td>
                   <td>
-                    <span className={`badge ${tk.gratuit ? "teal" : "orange"}`}>
-                      {tk.gratuit ? "Gratuit" : "Payant"}
+                    <span className={`badge ${tk.gratuit ? "teal" : tk.paye ? "green" : "yellow"}`}>
+                      {tk.gratuit ? "Gratuit" : tk.paye ? "Payé" : "Non payé"}
                     </span>
                   </td>
                   <td>
@@ -1208,7 +1208,7 @@ function Finances({ token }) {
       {/* ── Connexions facturées ── */}
       <div className="admin-section">
         <div className="section-header">
-          <h3><><CircleDot size={16} /> Connexions facturées (source de recette réelle) ({data.connexions.length})</></h3>
+          <h3><><CircleDot size={16} /> Connexions facturées (historique des sessions) ({data.connexions.length})</></h3>
         </div>
         <div className="table-wrapper">
           <table>
