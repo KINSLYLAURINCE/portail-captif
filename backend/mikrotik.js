@@ -99,17 +99,17 @@ function mikrotikCommand(words, timeout = 5000) {
                 i += len;
                 consumed = i;
 
-                if (word === "!done") { sentences.push({ type: "done" }); }
-                else if (word === "!re") { current = { type: "re" }; }
-                else if (word === "!trap") { current = { type: "trap" }; }
+                if (word === "!done") { sentences.push({ __reply: "done" }); }
+                else if (word === "!re") { current = { __reply: "re" }; }
+                else if (word === "!trap") { current = { __reply: "trap" }; }
                 else if (word.startsWith("=")) {
                     const eq = word.indexOf("=", 1);
                     if (eq > 0) {
-                        if (!current) current = { type: "re" };
+                        if (!current) current = { __reply: "re" };
                         current[word.slice(1, eq)] = word.slice(eq + 1);
                     }
                 } else if (word.startsWith(".id=")) {
-                    if (!current) current = { type: "re" };
+                    if (!current) current = { __reply: "re" };
                     current[".id"] = word.slice(4);
                 }
             }
@@ -140,28 +140,28 @@ function mikrotikCommand(words, timeout = 5000) {
 
             for (const s of sentences) {
                 if (!authenticated) {
-                    if (s.type === "done" || s.type === "re") {
+                    if (s.__reply === "done" || s.__reply === "re") {
                         authenticated = true;
                         // Envoyer la vraie commande
                         socket.write(encodeSentence(words));
-                    } else if (s.type === "trap") {
+                    } else if (s.__reply === "trap") {
                         clearTimeout(timer);
                         socket.destroy();
                         reject(new Error(`Erreur login Mikrotik: ${s.message || "Identifiants incorrects"}`));
                         return;
                     }
                 } else {
-                    if (s.type === "done") {
+                    if (s.__reply === "done") {
                         clearTimeout(timer);
                         socket.destroy();
                         resolve({ success: true, data: results });
                         return;
-                    } else if (s.type === "trap") {
+                    } else if (s.__reply === "trap") {
                         clearTimeout(timer);
                         socket.destroy();
                         reject(new Error(`Erreur Mikrotik: ${s.message || "Commande échouée"}`));
                         return;
-                    } else if (s.type === "re") {
+                    } else if (s.__reply === "re") {
                         results.push(s);
                     }
                 }
@@ -543,6 +543,239 @@ async function supprimerMacBypass(mac) {
     }
 }
 
+// ─── Gestion complète des serveurs Hotspot (création / suppression) ─────────
+
+function normaliserNomHotspot(nom) {
+    return String(nom || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-_]/g, "");
+}
+
+function ipVersEntier(ip) {
+    return ip.split(".").reduce((a, o) => ((a << 8) + (parseInt(o, 10) & 0xFF)) >>> 0, 0);
+}
+
+function entierVersIp(n) {
+    return [ (n >>> 24) & 0xFF, (n >>> 16) & 0xFF, (n >>> 8) & 0xFF, n & 0xFF ].join(".");
+}
+
+/**
+ * Calcule le réseau, la passerelle et la plage DHCP à partir d'une adresse CIDR
+ * @param {string} cidr - ex: "192.168.89.1/24" (préfixe /8 à /24)
+ */
+function calculerReseau(cidr) {
+    const m = String(cidr || "").trim().match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/(\d{1,2})$/);
+    if (!m) return null;
+    const ip = m[1];
+    if (!ipValide(ip)) return null;
+    const prefix = parseInt(m[2], 10);
+    if (prefix < 16 || prefix > 24) return null;
+    const ipInt = ipVersEntier(ip);
+    const masque = (0xFFFFFFFF << (32 - prefix)) >>> 0;
+    const reseau = (ipInt & masque) >>> 0;
+    const joker = (~masque) >>> 0;
+    const diffusion = (reseau | joker) >>> 0;
+    const debut = (reseau + 10) >>> 0;
+    const fin = (diffusion - 1) >>> 0;
+    if (fin <= debut) return null;
+    return {
+        ip, prefix,
+        reseau: `${entierVersIp(reseau)}/${prefix}`,
+        gateway: ip,
+        debut: entierVersIp(debut),
+        fin: entierVersIp(fin),
+    };
+}
+
+function ipValide(ip) {
+    const p = String(ip || "").split(".");
+    return p.length === 4 && p.every(o => /^\d{1,3}$/.test(o) && parseInt(o, 10) <= 255);
+}
+
+/**
+ * Lister les interfaces disponibles (pour choisir celle du hotspot)
+ */
+async function listerInterfaces() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", data: [] };
+    try {
+        const [result, dres, hres] = await Promise.all([
+            mikrotikCommand(["/interface/print"]),
+            mikrotikCommand(["/ip/dhcp-server/print"]),
+            mikrotikCommand(["/ip/hotspot/print"]),
+        ]);
+        const dhcpIf = new Set((dres.data || []).map(d => d.interface));
+        const hsIf = new Set((hres.data || []).map(h => h.interface));
+        const data = (result.data || []).map(i => ({
+            nom: i.name,
+            type: i.type || "",
+            actif: i.running === "true",
+            desactive: i.disabled === "true",
+            esclave: i.slave === "true",
+            commentaire: i.comment || "",
+            dejaHotspot: hsIf.has(i.name),
+            dejaDhcp: dhcpIf.has(i.name),
+        }));
+        return { success: true, data };
+    } catch (err) {
+        return { success: false, message: err.message, data: [] };
+    }
+}
+
+/**
+ * Lister les profils de serveur Hotspot (login-by, hotspot-address)
+ */
+async function listerProfilsServeur() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", data: [] };
+    try {
+        const result = await mikrotikCommand(["/ip/hotspot/profile/print"]);
+        const data = (result.data || []).map(p => ({
+            nom: p.name,
+            loginBy: p["login-by"] || "",
+            hotspotAddress: p["hotspot-address"] || "0.0.0.0",
+        }));
+        return { success: true, data };
+    } catch (err) {
+        return { success: false, message: err.message, data: [] };
+    }
+}
+
+/**
+ * Créer un serveur Hotspot complet sur Mikrotik
+ * (adresse IP + pool + serveur DHCP + réseau DHCP + profil + serveur hotspot)
+ * Tous les éléments portent le commentaire `SMD-HS:<nom>` pour la suppression.
+ * @param {{nom:string, interface:string, adresse:string, profilServer?:string}} opts
+ */
+async function creerHotspot(opts) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+
+    const nom = normaliserNomHotspot(opts.nom);
+    if (!nom) return { success: false, message: "Nom de hotspot invalide (lettres, chiffres, tirets)." };
+
+    const iface = String(opts.interface || "").trim();
+    if (!iface) return { success: false, message: "Interface requise." };
+
+    const reseau = calculerReseau(opts.adresse);
+    if (!reseau) {
+        return { success: false, message: "Adresse IP invalide. Format attendu : 192.168.89.1/24 (préfixe /8 à /24)." };
+    }
+
+    // Refuser un doublon de nom
+    const exist = await mikrotikCommand(["/ip/hotspot/print"]);
+    if ((exist.data || []).some(h => h.name === nom)) {
+        return { success: false, message: `Un hotspot nommé "${nom}" existe déjà.` };
+    }
+
+    // Un seul serveur hotspot/DHCP par interface : vérifier que l'interface est libre
+    const [dhcps, hsList] = await Promise.all([
+        mikrotikCommand(["/ip/dhcp-server/print"]),
+        exist,
+    ]);
+    const hsIface = (hsList.data || []).find(h => h.interface === iface);
+    if (hsIface) {
+        return { success: false, message: `L'interface "${iface}" héberge déjà le hotspot "${hsIface.name}". RouterOS n'autorise qu'un seul hotspot par interface : utilisez une interface dédiée (port libre ou VLAN).` };
+    }
+    const dhcpOnIface = (dhcps.data || []).find(d => d.interface === iface);
+    if (dhcpOnIface) {
+        return { success: false, message: `L'interface "${iface}" a déjà un serveur DHCP ("${dhcpOnIface.name}"). Un deuxième hotspot nécessite une interface dédiée (port réseau libre ou VLAN).` };
+    }
+
+    const tag = `SMD-HS:${nom}`;
+    const poolNom = `${nom}-pool`;
+    const dhcpNom = `${nom}-dhcp`;
+    const profilNom = opts.profilServer ? String(opts.profilServer).trim() : `${nom}-prof`;
+
+    try {
+        // 1. Adresse IP sur l'interface
+        await mikrotikCommand(["/ip/address/add", `=address=${opts.adresse}`, `=interface=${iface}`, `=comment=${tag}`]);
+        // 2. Pool d'adresses
+        await mikrotikCommand(["/ip/pool/add", `=name=${poolNom}`, `=ranges=${reseau.debut}-${reseau.fin}`, `=comment=${tag}`]);
+        // 3. Serveur DHCP
+        await mikrotikCommand(["/ip/dhcp-server/add", `=name=${dhcpNom}`, `=interface=${iface}`, `=address-pool=${poolNom}`, `=lease-time=30m`, `=disabled=no`, `=comment=${tag}`]);
+        // 4. Réseau DHCP (passerelle + DNS)
+        await mikrotikCommand(["/ip/dhcp-server/network/add", `=address=${reseau.reseau}`, `=gateway=${reseau.gateway}`, `=dns-server=${reseau.gateway}`, `=comment=${tag}`]);
+        // 5. Profil serveur hotspot (créé seulement si l'admin n'en choisit pas un existant)
+        //    Note : ce RouterOS n'accepte pas le paramètre `comment` sur le profil.
+        if (!opts.profilServer) {
+            await mikrotikCommand(["/ip/hotspot/profile/add", `=name=${profilNom}`, `=hotspot-address=${reseau.gateway}`, `=login-by=cookie,http-chap,http-pap`, `=html-directory=hotspot`]);
+        }
+        // 6. Serveur hotspot (pas de `comment` supporté non plus)
+        await mikrotikCommand(["/ip/hotspot/add", `=name=${nom}`, `=interface=${iface}`, `=address-pool=${poolNom}`, `=profile=${profilNom}`, `=disabled=no`]);
+
+        return {
+            success: true,
+            nom,
+            reseau,
+            message: `Hotspot "${nom}" créé sur ${iface} — réseau ${reseau.reseau}, passerelle ${reseau.gateway}, pool ${reseau.debut}-${reseau.fin}.`,
+        };
+    } catch (err) {
+        // Rollback : supprimer tout ce qui a été créé (repéré par le commentaire)
+        try { await supprimerHotspot(nom); } catch { /* ignore */ }
+        return { success: false, message: `Erreur création hotspot: ${err.message}` };
+    }
+}
+
+/**
+ * Supprimer les éléments portant le commentaire SMD-HS:<nom> dans un chemin donné
+ */
+async function supprimerParCommentaire(chemin, tag) {
+    const res = await mikrotikCommand([`${chemin}/print`]);
+    const items = (res.data || []).filter(i => (i.comment || "") === tag);
+    for (const it of items) {
+        await mikrotikCommand([`${chemin}/remove`, `=.id=${it[".id"]}`]);
+    }
+    return items.length;
+}
+
+/**
+ * Supprimer un serveur Hotspot et ses dépendances créées par le dashboard
+ */
+async function supprimerHotspot(nom) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    const nomN = normaliserNomHotspot(nom);
+    const tag = `SMD-HS:${nomN}`;
+    try {
+        let n = 0;
+        // Le serveur hotspot peut avoir été créé hors dashboard : le retirer par nom
+        const hs = await mikrotikCommand(["/ip/hotspot/print"]);
+        const cibles = (hs.data || []).filter(h => h.name === nomN || (h.comment || "") === tag);
+        for (const h of cibles) {
+            await mikrotikCommand(["/ip/hotspot/remove", `=.id=${h[".id"]}`]);
+            n++;
+        }
+        n += await supprimerParCommentaire("/ip/hotspot/profile", tag);
+        // Le profil créé automatiquement n'a pas de commentaire : le repérer par son nom
+        const profRes = await mikrotikCommand(["/ip/hotspot/profile/print"]);
+        for (const p of (profRes.data || [])) {
+            if (p.name === `${nomN}-prof`) {
+                await mikrotikCommand(["/ip/hotspot/profile/remove", `=.id=${p[".id"]}`]);
+                n++;
+            }
+        }
+        n += await supprimerParCommentaire("/ip/dhcp-server/network", tag);
+        n += await supprimerParCommentaire("/ip/dhcp-server", tag);
+        n += await supprimerParCommentaire("/ip/pool", tag);
+        n += await supprimerParCommentaire("/ip/address", tag);
+        if (n === 0) return { success: false, message: `Aucun hotspot "${nomN}" trouvé.` };
+        return { success: true, message: `Hotspot "${nomN}" supprimé (${n} élément(s)).` };
+    } catch (err) {
+        return { success: false, message: `Erreur suppression hotspot: ${err.message}` };
+    }
+}
+
+/**
+ * Activer / désactiver un serveur Hotspot
+ */
+async function basculerHotspot(nom, actif) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        const res = await mikrotikCommand(["/ip/hotspot/print"]);
+        const hs = (res.data || []).find(h => h.name === nom);
+        if (!hs) return { success: false, message: `Hotspot "${nom}" introuvable.` };
+        await mikrotikCommand(["/ip/hotspot/set", `=.id=${hs[".id"]}`, `=disabled=${actif ? "no" : "yes"}`]);
+        return { success: true, message: `Hotspot "${nom}" ${actif ? "activé" : "désactivé"}.` };
+    } catch (err) {
+        return { success: false, message: `Erreur: ${err.message}` };
+    }
+}
+
 module.exports = {
     MIKROTIK_ENABLED,
     testerConnexion,
@@ -559,4 +792,9 @@ module.exports = {
     listerHotspots,
     ajouterMacBypass,
     supprimerMacBypass,
+    listerInterfaces,
+    listerProfilsServeur,
+    creerHotspot,
+    supprimerHotspot,
+    basculerHotspot,
 };

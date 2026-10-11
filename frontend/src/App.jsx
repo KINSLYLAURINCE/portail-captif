@@ -28,6 +28,30 @@ function getMac() {
   return mac || null;
 }
 
+// ─── Adresse de la passerelle hotspot (pour le POST /login du routeur) ────
+const GATEWAY_FALLBACK = "192.168.88.1";
+
+function ipVersGateway(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec((ip || "").trim());
+  if (!m) return null;
+  return `${m[1]}.${m[2]}.${m[3]}.1`;
+}
+
+// Le routeur fournit ?ip=<IP client> dans l'URL de redirection ; la passerelle
+// du hotspot est la même adresse avec le dernier octet à 1.
+function getGateway() {
+  let gw = localStorage.getItem("smd_gateway");
+  try {
+    const param = new URLSearchParams(window.location.search).get("ip");
+    const derive = param ? ipVersGateway(param) : null;
+    if (derive) {
+      gw = derive;
+      localStorage.setItem("smd_gateway", gw);
+    }
+  } catch {}
+  return gw || GATEWAY_FALLBACK;
+}
+
 // ─── Sauvegarder / récupérer le dernier ticket ────────────────────────────
 function sauvegarderTicket(ticket, forfait) {
   localStorage.setItem("smd_last_ticket", JSON.stringify({ ticket, forfait, date: new Date().toISOString() }));
@@ -57,13 +81,13 @@ function fmtTemps(sec) {
 }
 
 // ─── Connexion automatique au portail captif Mikrotik (HTTP PAP) ──────────
-const HOTSPOT_LOGIN_URL = "http://192.168.88.1/login";
 function connexionPortailCaptif(code, cible = "http://www.google.com") {
   if (!code) { window.location.href = cible; return; }
+  const url = `http://${getGateway()}/login`;
   try {
     const form = document.createElement("form");
     form.method = "POST";
-    form.action = HOTSPOT_LOGIN_URL;
+    form.action = url;
     const add = (name, value) => {
       const input = document.createElement("input");
       input.type = "hidden";
