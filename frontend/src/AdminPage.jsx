@@ -141,7 +141,7 @@ function Forfaits({ token }) {
   const [form, setForm] = useState({ nom: "", prix: "", quota: "", debit: "10 Mbps", duree: "", profilMikrotik: "", statut: "actif", gratuit: false, appareilUnique: false });
   const [loading, setLoading] = useState(false);
   const debits = ["1 Mbps","2 Mbps","5 Mbps","10 Mbps","20 Mbps","50 Mbps","100 Mbps","Illimité"];
-  const durees = ["30 minutes","1 heure","2 heures","3 heures","6 heures","12 heures","24 heures","3 jours","7 jours","30 jours","Illimité"];
+  const durees = ["5 minutes","10 minutes","15 minutes","20 minutes","30 minutes","45 minutes","1 heure","2 heures","3 heures","6 heures","12 heures","24 heures","3 jours","7 jours","30 jours","Illimité"];
   const showMsg = (text, type = "success") => { setMsg({ text, type }); setTimeout(() => setMsg({ text: "", type: "" }), 3000); };
   const charger = () => axios.get("/api/admin/forfaits", { headers: { Authorization: `Bearer ${token}` } }).then(r => setForfaits(r.data.forfaits)).catch(() => {});
   useEffect(() => { charger(); }, []);
@@ -1300,16 +1300,68 @@ function Parametres({ token }) {
 // ─── Hotspots ──────────────────────────────────────────────────────────
 function Hotspots({ token }) {
   const [data, setData] = useState(null);
+  const [options, setOptions] = useState({ interfaces: [], profils: [] });
+  const [form, setForm] = useState({ nom: "", interface: "", adresse: "", profilServer: "" });
+  const [message, setMessage] = useState(null);
+  const [loading, setLoading] = useState(false);
   const hdr = { headers: { Authorization: `Bearer ${token}` } };
+
   const charger = () => axios.get("/api/admin/hotspots", hdr).then(r => setData(r.data)).catch(() => setData({ success: false, connecte: false, hotspots: [] }));
-  useEffect(() => { charger(); const i = setInterval(charger, 10000); return () => clearInterval(i); }, []);
+  const chargerOptions = () => axios.get("/api/admin/hotspots/options", hdr)
+    .then(r => setOptions({ interfaces: r.data.interfaces || [], profils: r.data.profils || [] }))
+    .catch(() => {});
+  useEffect(() => { charger(); chargerOptions(); const i = setInterval(charger, 10000); return () => clearInterval(i); }, []);
 
   const hotspots = data?.hotspots || [];
   const clientsTotal = hotspots.reduce((a, h) => a + (h.clients || 0), 0);
+  const interfaces = (options.interfaces || []).filter(i => !i.esclave && i.type !== "wg" && i.type !== "loopback");
+
+  const handleCreer = async (e) => {
+    e.preventDefault();
+    setMessage(null);
+    if (!form.nom || !form.interface || !form.adresse) {
+      setMessage({ type: "error", texte: "Nom, interface et adresse IP (CIDR) sont requis." });
+      return;
+    }
+    setLoading(true);
+    try {
+      const r = await axios.post("/api/admin/hotspots", form, hdr);
+      setMessage({ type: "success", texte: r.data.message || "Hotspot créé." });
+      setForm({ nom: "", interface: "", adresse: "", profilServer: "" });
+      charger(); chargerOptions();
+    } catch (err) {
+      setMessage({ type: "error", texte: err.response?.data?.message || "Erreur lors de la création du hotspot." });
+    } finally { setLoading(false); }
+  };
+
+  const handleToggle = async (h) => {
+    setMessage(null);
+    const actif = h.statut !== "actif";
+    try {
+      const r = await axios.patch("/api/admin/hotspots/toggle", { nom: h.nom, actif }, hdr);
+      setMessage({ type: "success", texte: r.data.message });
+      charger();
+    } catch (err) {
+      setMessage({ type: "error", texte: err.response?.data?.message || "Erreur." });
+    }
+  };
+
+  const handleSupprimer = async (h) => {
+    if (!window.confirm(`Supprimer définitivement le hotspot "${h.nom}" du routeur ?\n\nLes sessions actives sur ce réseau seront coupées.`)) return;
+    setMessage(null);
+    try {
+      const r = await axios.delete("/api/admin/hotspots", { ...hdr, params: { nom: h.nom } });
+      setMessage({ type: "success", texte: r.data.message || "Hotspot supprimé." });
+      charger(); chargerOptions();
+    } catch (err) {
+      setMessage({ type: "error", texte: err.response?.data?.message || "Erreur lors de la suppression." });
+    }
+  };
 
   return (
     <div className="tab-content">
       <h2 className="section-title"><><Wifi size={20} /> Hotspots (routeur Mikrotik)</></h2>
+
       <div className="admin-section">
         <div className="mikrotik-status">
           <div className="mikrotik-card">
@@ -1321,21 +1373,79 @@ function Hotspots({ token }) {
         </div>
         {data && !data.connecte && <div className="feedback error" style={{ marginTop: 10 }}>{data.message || "Mikrotik injoignable."}</div>}
         <div className="form-group form-btn" style={{ marginTop: 12 }}>
-          <button className="btn-edit" onClick={charger}>Rafraîchir</button>
+          <button className="btn-edit" onClick={() => { charger(); chargerOptions(); }}>Rafraîchir</button>
         </div>
       </div>
+
+      <div className="admin-section">
+        <h3><><Plus size={16} /> Créer un hotspot</></h3>
+        <p className="empty-msg" style={{ textAlign: "left", padding: "0 0 12px" }}>
+          Crée un serveur hotspot complet sur le routeur : adresse IP + pool + serveur DHCP + profil + serveur hotspot.
+          Le réseau Wi-Fi doit être branché sur l'interface choisie (ou sur un pont/VLAN rattaché à celle-ci).
+        </p>
+        <form onSubmit={handleCreer}>
+          <div className="form-group"><label>Nom du hotspot</label><input type="text" placeholder="Ex: terrasse" value={form.nom} onChange={e => setForm({ ...form, nom: e.target.value })} /></div>
+          <div className="form-group">
+            <label>Interface réseau</label>
+            <select value={form.interface} onChange={e => setForm({ ...form, interface: e.target.value })}>
+              <option value="">-- Choisir une interface --</option>
+              {interfaces.map(i => {
+                const occupe = i.dejaHotspot || i.dejaDhcp;
+                const suffixe = i.dejaHotspot ? " — hotspot déjà présent" : i.dejaDhcp ? " — serveur DHCP déjà présent" : "";
+                return (
+                  <option key={i.nom} value={i.nom} disabled={occupe}>
+                    {i.nom} ({i.type}{i.actif ? ", actif" : ", inactif"}){suffixe}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Adresse IP de la passerelle (CIDR)</label>
+            <input type="text" placeholder="Ex: 192.168.89.1/24" value={form.adresse} onChange={e => setForm({ ...form, adresse: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Profil serveur hotspot</label>
+            <select value={form.profilServer} onChange={e => setForm({ ...form, profilServer: e.target.value })}>
+              <option value="">Créer automatiquement (recommandé)</option>
+              {(options.profils || []).map(p => (
+                <option key={p.nom} value={p.nom}>{p.nom}{p.hotspotAddress && p.hotspotAddress !== "0.0.0.0" ? ` (${p.hotspotAddress})` : ""}</option>
+              ))}
+            </select>
+          </div>
+          <div className="form-group form-btn">
+            <button type="submit" disabled={loading}>{loading ? "..." : <><Plus size={14} /> Créer le hotspot</>}</button>
+          </div>
+          <p style={{ fontSize: "0.8rem", color: "#94a3b8", marginTop: 6 }}>
+            Un pool 192.168.x.10 - 192.168.x.254 et un DHCP sont créés automatiquement pour le sous-réseau indiqué.
+          </p>
+        </form>
+        {message && <div className={`feedback ${message.type}`} style={{ marginTop: 10 }}>{message.texte}</div>}
+      </div>
+
       <div className="admin-section">
         <h3><><List size={16} /> Liste des hotspots ({hotspots.length})</></h3>
         <div className="table-wrapper"><table>
-          <thead><tr><th>Nom</th><th>Interface</th><th>Profil</th><th>Pool</th><th>Clients</th><th>Statut</th></tr></thead>
-          <tbody>{hotspots.length === 0 ? <tr><td colSpan="6" className="empty-msg">Aucun hotspot détecté sur le routeur.</td></tr> : hotspots.map(h => (
+          <thead><tr><th>Nom</th><th>Interface</th><th>Profil</th><th>Pool</th><th>Clients</th><th>Statut</th><th>Actions</th></tr></thead>
+          <tbody>{hotspots.length === 0 ? <tr><td colSpan="7" className="empty-msg">Aucun hotspot détecté sur le routeur.</td></tr> : hotspots.map(h => (
             <tr key={h.id}>
-              <td><strong>{h.nom}</strong></td>
+              <td>
+                <strong>{h.nom}</strong>
+                {h.gere && <span className="badge green" style={{ marginLeft: 6 }}>dashboard</span>}
+              </td>
               <td><span className="code-cell">{h.interface || "—"}</span></td>
               <td>{h.profil || "—"}</td>
               <td>{h.pool || "—"}</td>
               <td><span className="badge blue">{h.clients || 0}</span></td>
               <td><span className={`badge ${h.statut === "actif" ? "actif" : "inactif"}`}>{h.statut === "actif" ? "Actif" : "Inactif"}</span></td>
+              <td>
+                <div className="actions-cell">
+                  <button className={`btn-toggle ${h.statut === "actif" ? "desactiver" : "activer"}`} onClick={() => handleToggle(h)}>
+                    {h.statut === "actif" ? "Désactiver" : "Activer"}
+                  </button>
+                  <button className="btn-supprimer" onClick={() => handleSupprimer(h)}>Supprimer</button>
+                </div>
+              </td>
             </tr>
           ))}</tbody>
         </table></div>
