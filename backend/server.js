@@ -135,7 +135,12 @@ function verifierAppareil(ticket, ip, userAgent, deviceId, mac) {
 function dureeEnMs(duree) {
     if (!duree) return null;
     const map = {
+        "5 minutes":  5  * 60 * 1000,
+        "10 minutes": 10 * 60 * 1000,
+        "15 minutes": 15 * 60 * 1000,
+        "20 minutes": 20 * 60 * 1000,
         "30 minutes": 30 * 60 * 1000,
+        "45 minutes": 45 * 60 * 1000,
         "1 heure":    1  * 3600 * 1000,
         "2 heures":   2  * 3600 * 1000,
         "3 heures":   3  * 3600 * 1000,
@@ -936,16 +941,18 @@ app.get("/api/admin/hotspots", adminAuth, async (req, res) => {
     }
 
     const hotspots = (srv.data || []).map(h => {
-        const desactive = h.disabled === "true" || h.disabled === true;
+        const disabled = h.disabled === "true" || h.disabled === true;
         return {
             id: h[".id"],
             nom: h.name,
-            interface: h.interface || null,
+            interface: h.interface,
             profil: h.profile || null,
             pool: h["address-pool"] || null,
-            https: h.HTTPS === "true" || h.HTTPS === true,
+            https: h.HTTPS === "true",
+            comment: h.comment || "",
+            gere: (h["address-pool"] || "") === `${h.name}-pool`,
             clients: countParNom[h.name] || 0,
-            statut: desactive ? "inactif" : "actif",
+            statut: disabled ? "inactif" : "actif",
             source: "mikrotik"
         };
     });
@@ -958,39 +965,42 @@ app.get("/api/admin/hotspots", adminAuth, async (req, res) => {
     });
 });
 
+app.get("/api/admin/hotspots/options", adminAuth, async (req, res) => {
+    const [ifs, profs] = await Promise.all([mk.listerInterfaces(), mk.listerProfilsServeur()]);
+    res.json({
+        success: true,
+        connecte: ifs.success,
+        message: ifs.success ? null : (ifs.message || "Mikrotik injoignable"),
+        interfaces: ifs.data || [],
+        profils: profs.data || []
+    });
+});
+
 app.post("/api/admin/hotspots", adminAuth, async (req, res) => {
-    const { nom, lieu, ip, debit } = req.body;
-    if (!nom || !lieu || !ip) return res.status(400).json({ success: false, message: "Nom, lieu et IP requis." });
-    const dup = await pool.query("SELECT 1 FROM hotspots WHERE ip = $1", [ip]);
-    if (dup.rowCount > 0) return res.status(409).json({ success: false, message: "IP déjà utilisée." });
-    const hRes = await pool.query(
-        "INSERT INTO hotspots (nom, lieu, ip, statut, clients, debit) VALUES ($1, $2, $3, 'actif', 0, $4) RETURNING *",
-        [nom.trim(), lieu.trim(), ip.trim(), debit || "10 Mbps"]
-    );
-    const h = mapRow(hRes.rows[0]);
-    await ajouterLog("hotspot", `Hotspot "${h.nom}" ajouté`);
-    return res.status(201).json({ success: true, message: "Hotspot ajouté.", hotspot: h });
+    const { nom, interface: iface, adresse, profilServer } = req.body;
+    if (!nom || !iface || !adresse) {
+        return res.status(400).json({ success: false, message: "Nom, interface et adresse IP (CIDR) requis." });
+    }
+    const result = await mk.creerHotspot({ nom, interface: iface, adresse, profilServer });
+    if (!result.success) return res.status(400).json(result);
+    await ajouterLog("hotspot", `Hotspot "${result.nom}" créé sur ${iface} (${adresse})`);
+    return res.status(201).json(result);
 });
 
-app.patch("/api/admin/hotspots/:id/toggle", adminAuth, async (req, res) => {
-    const upRes = await pool.query(
-        `UPDATE hotspots SET
-            statut = CASE WHEN statut = 'actif' THEN 'inactif' ELSE 'actif' END,
-            clients = CASE WHEN statut = 'actif' THEN 0 ELSE clients END
-         WHERE id = $1 RETURNING *`,
-        [parseInt(req.params.id)]
-    );
-    if (upRes.rowCount === 0) return res.status(404).json({ success: false, message: "Hotspot introuvable." });
-    const h = mapRow(upRes.rows[0]);
-    await ajouterLog("hotspot", `Hotspot "${h.nom}" ${h.statut}`);
-    return res.json({ success: true, message: `Hotspot "${h.nom}" ${h.statut}.`, hotspot: h });
+app.patch("/api/admin/hotspots/toggle", adminAuth, async (req, res) => {
+    const { nom, actif } = req.body;
+    if (!nom) return res.status(400).json({ success: false, message: "Nom du hotspot requis." });
+    const result = await mk.basculerHotspot(nom, !!actif);
+    if (result.success) await ajouterLog("hotspot", result.message);
+    return res.status(result.success ? 200 : 400).json(result);
 });
 
-app.delete("/api/admin/hotspots/:id", adminAuth, async (req, res) => {
-    const delRes = await pool.query("DELETE FROM hotspots WHERE id = $1 RETURNING nom", [parseInt(req.params.id)]);
-    if (delRes.rowCount === 0) return res.status(404).json({ success: false, message: "Hotspot introuvable." });
-    await ajouterLog("hotspot", `Hotspot "${delRes.rows[0].nom}" supprimé`);
-    return res.json({ success: true, message: "Hotspot supprimé." });
+app.delete("/api/admin/hotspots", adminAuth, async (req, res) => {
+    const nom = req.query.nom || (req.body && req.body.nom);
+    if (!nom) return res.status(400).json({ success: false, message: "Nom du hotspot requis." });
+    const result = await mk.supprimerHotspot(nom);
+    if (result.success) await ajouterLog("hotspot", result.message);
+    return res.status(result.success ? 200 : 400).json(result);
 });
 
 // ─────────────────────────────────────────
