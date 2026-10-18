@@ -75,8 +75,13 @@ cd /opt/portail-captif && git diff > /root/vps-changes-$D.patch
 # c) Sauvegarde PostgreSQL
 sudo -u postgres pg_dump portail_captif > /root/backup_portail_$D.sql
 ls -lh /root/*$D*
-'@; $script | ssh root@84.247.137.170 'bash -s'
+'@; ($script -replace "`r", "") | ssh root@84.247.137.170 'bash -s'
 ```
+
+> **Important PowerShell :** toujours filtrer le here-string avec
+> `($script -replace "`r", "")` avant de l'envoyer en pipe à `ssh` —
+> sinon les retours chariot CRLF cassent les dernières commandes du script
+> côté Linux (fichiers avec `\r` dans le nom, options invalides…).
 
 ### 4. VPS — mise à jour du code
 
@@ -86,7 +91,7 @@ cd /opt/portail-captif
 git fetch origin
 git reset --hard origin/master
 git log --oneline -3
-'@; $script | ssh root@84.247.137.170 'bash -s'
+'@; ($script -replace "`r", "") | ssh root@84.247.137.170 'bash -s'
 ```
 
 ### 5. VPS — redémarrage
@@ -105,7 +110,8 @@ $script = @'
 echo --- PM2 ---
 pm2 status smd-connect | head -8
 echo --- LOGS ---
-pm2 logs smd-connect --lines 15 --nostream
+tail -n 15 ~/.pm2/logs/smd-connect-out.log
+tail -n 5 ~/.pm2/logs/smd-connect-error.log
 echo --- API ---
 curl -s http://localhost:5000/api/test
 echo
@@ -113,12 +119,13 @@ curl -s http://localhost:5000/api/forfaits | head -c 200
 echo
 echo --- COLONNE MAC ---
 sudo -u postgres psql portail_captif -c "\d appareils_gratuits" | grep -i mac
-'@; $script | ssh root@84.247.137.170 'bash -s'
+'@; ($script -replace "`r", "") | ssh root@84.247.137.170 'bash -s'
 ```
 
 Critères de succès :
-- PM2 : `status = online`, `restarts = 0`
-- Logs : `✅ [DB] PostgreSQL prêt` sans erreur
+- PM2 : `status = online`, et le compteur `↺` **n'augmente plus** après 30 s
+  (un crash-loop se manifeste par un compteur qui grimpe à chaque seconde)
+- Logs : `✅ [DB] PostgreSQL prêt` et `🚀 Serveur SMD-CONNECT démarré` sans erreur
 - `GET /api/test` → `{"success":true,...}`
 - `\d appareils_gratuits` montre la colonne `mac`
 
@@ -138,7 +145,7 @@ tar -xzf /root/portail-captif-backup-$D.tar.gz -C /opt
 pm2 restart smd-connect
 # Si la base a été migrée et qu'on veut revenir en arrière :
 # sudo -u postgres psql portail_captif < /root/backup_portail_$D.sql
-'@; $script | ssh root@84.247.137.170 'bash -s'
+'@; ($script -replace "`r", "") | ssh root@84.247.137.170 'bash -s'
 ```
 
 Le patch des non-commités sauvegardé (`vps-changes-*.patch`) permet de
@@ -167,5 +174,28 @@ rejouer à la main d'éventuelles modifications locales du VPS :
    commitée et pushée, sinon elle sera écrasée au prochain déploiement
 5. `gestion-stock-api` (autre process PM2) et nginx `somady.online` sont
    **hors périmètre** — ne pas les redémarrer ni reconfigurer
+
+---
+
+## 🪤 Pièges connus (retours d'expérience)
+
+1. **Ordre des migrations DB** : ne jamais créer un index sur une colonne
+   ajoutée par migration *avant* l'`ALTER TABLE` — sur une base existante,
+   `CREATE TABLE IF NOT EXISTS` est un no-op et l'index crash le démarrage
+   (`column "mac" does not exist` en boucle dans PM2). Voir `initSchema()`
+   dans `backend/db.js` : ALTER d'abord, index ensuite.
+2. **Frontend `dist/` ignoré par git** : `frontend/.gitignore` contient `dist`,
+   mais les bundles JS sont trackés en force-add. Après un `npm run build`,
+   il faut **`git add -f frontend/dist`** sinon les anciens fichiers sont
+   supprimés du repo et les nouveaux jamais ajoutés → frontend cassé en prod.
+3. **PowerShell + ssh** : toujours `($script -replace "`r", "") | ssh ...` —
+   sans cela, la dernière commande du script reçoit un `\r` et échoue
+   silencieusement.
+4. **`pm2 logs --nostream`** n'est pas supporté par la version installée sur
+   le VPS : lire directement `~/.pm2/logs/smd-connect-{out,error}.log`.
+5. **Diagnostic crash-loop** : si le compteur `↺` de PM2 grimpe après un
+   redémarrage, le serveur plante au démarrage → `tail` sur le fichier
+   `error.log` avant toute autre action.
+
 
 
