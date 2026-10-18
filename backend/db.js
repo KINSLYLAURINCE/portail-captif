@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS appareils_gratuits (
     date_utilisation TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (appareil_id, forfait_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id);
+-- index idx_appareils_gratuits_mac cree dans initSchema() APRES les ALTER TABLE
 
 CREATE TABLE IF NOT EXISTS paiements_fapshi (
     id               SERIAL PRIMARY KEY,
