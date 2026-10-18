@@ -495,32 +495,28 @@ async function listerHotspots() {
 }
 
 /**
- * S'assurer que "mac" figure dans le login-by des profils serveur hotspot
- * utilisés. Sans cela, RouterOS affiche la page de login même pour les
- * utilisateurs liés à une MAC — le bypass ne fonctionne pas.
+ * S'assurer que "mac" figure dans le login-by de TOUS les profils hotspot.
+ * RouterOS 7 n'a pas la propriété "open-status-page" sur les profils — ne pas
+ * la tenter (une propriété inexistante fait échouer toute la commande set).
+ * Mise à jour profil par profil (try/catch) pour ne pas annuler les autres.
  */
 async function activerLoginByMac() {
-    const hs = await mikrotikCommand(["/ip/hotspot/print"]);
-    const profilsUtilises = new Set((hs.data || []).map(h => h.profile).filter(Boolean));
-    if (profilsUtilises.size === 0) return;
-
     const profs = await mikrotikCommand(["/ip/hotspot/profile/print"]);
     for (const p of profs.data || []) {
-        if (!profilsUtilises.has(p.name)) continue;
-        const loginBy = String(p["login-by"] || "");
-        const methods = loginBy.split(",").map(s => s.trim()).filter(Boolean);
-        const maj = [];
-        if (!methods.includes("mac")) {
-            // garder les méthodes existantes et ajouter mac
-            methods.push("mac");
-            maj.push(`=login-by=${methods.join(",")}`);
-        }
-        if (p["open-status-page"] !== "http-login") {
-            // éviter la popup de statut après un login MAC automatique
-            maj.push("=open-status-page=http-login");
-        }
-        if (maj.length > 0) {
-            await mikrotikCommand(["/ip/hotspot/profile/set", `=.id=${p[".id"]}`, ...maj]);
+        try {
+            const loginBy = String(p["login-by"] || "");
+            const methods = loginBy.split(",").map(s => s.trim()).filter(Boolean);
+            if (!methods.includes("mac")) {
+                // mac en premier : tentative de login MAC avant cookie/chap
+                methods.unshift("mac");
+                await mikrotikCommand([
+                    "/ip/hotspot/profile/set",
+                    `=.id=${p[".id"]}`,
+                    `=login-by=${methods.join(",")}`,
+                ]);
+            }
+        } catch (e) {
+            console.warn(`⚠️  Impossible d'activer login-by=mac sur le profil ${p.name}: ${e.message}`);
         }
     }
 }
@@ -535,7 +531,7 @@ async function activerLoginByMac() {
 async function ajouterMacBypass(mac, nom, debit) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
-        // Normaliser la MAC au format Mikrotik (minuscules)
+        // Format attendu par mac-as-username-and-password : minuscules + deux-points
         const macMK = normaliserMac(mac).toLowerCase();
 
         // Vérifier si l'entrée existe déjà
@@ -547,15 +543,16 @@ async function ajouterMacBypass(mac, nom, debit) {
         const rateLimit = debit && debit !== "0" ? `${debit}/${debit}` : "";
 
         if (existing.data && existing.data.length > 0) {
-            // Mettre à jour l'entrée existante
+            // Mettre à jour l'entrée existante (rename vers format colon si legacy)
             const id = existing.data[0][".id"];
             const words = [
                 "/ip/hotspot/user/set",
                 `=.id=${id}`,
-                `=comment=Compte privilégié: ${nom}`,
+                `=name=${macMK}`,
                 // Avec le mac-auth-mode par défaut (mac-as-username-and-password),
-                // RouterOS attend le MAC comme mot de passe de l'utilisateur
+                // RouterOS envoie le MAC comme username ET mot de passe
                 `=password=${macMK}`,
+                `=comment=Compte privilégié: ${nom}`,
             ];
             if (rateLimit) words.push(`=rate-limit=${rateLimit}`);
             await mikrotikCommand(words);
