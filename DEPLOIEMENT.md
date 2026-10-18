@@ -196,6 +196,15 @@ rejouer à la main d'éventuelles modifications locales du VPS :
 5. **Diagnostic crash-loop** : si le compteur `↺` de PM2 grimpe après un
    redémarrage, le serveur plante au démarrage → `tail` sur le fichier
    `error.log` avant toute autre action.
+6. **RouterOS 7 vs propriétés hotspot** : `open-status-page` n'existe PAS sur
+   les profils hotspot RouterOS 7.19 — une tentative de `set` sur une
+   propriété inexistante fait échouer **toute la commande** (trap), d'où un
+   `login-by=mac` qui ne s'appliquait jamais. Ne jamais deviner des propriétés :
+   printer le profil complet d'abord.
+7. **Format du username MAC** : avec `mac-auth-mode=mac-as-username-and-password`
+   (défaut), RouterOS envoie le MAC comme username ET password au format
+   **minuscules + deux-points** (`aa:bb:cc:dd:ee:ff`) — les users créés au
+   format tirets (`aa-bb-cc-...`) ne matchent jamais.
 
 
 
