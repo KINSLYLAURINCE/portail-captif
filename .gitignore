@@ -36,3 +36,6 @@ Thumbs.db
 
 # Data backups (legacy)
 backend/data.json
+
+# Doc ops locale (VPS, procédures) — jamais sur git
+DEPLOIEMENT.md
