@@ -302,6 +302,29 @@ function normaliserMac(mac) {
     return mac.trim().toUpperCase().replace(/-/g, ":");
 }
 
+/**
+ * Résoudre l'adresse MAC réelle d'une IP client via le Mikrotik
+ * (table ARP, puis bail DHCP en secours). Retourne la MAC normalisée
+ * ou null si introuvable. Permet de limiter les forfaits gratuits par
+ * MAC de façon non falsifiable (contrairement à un paramètre d'URL).
+ */
+async function macDepuisIp(ip) {
+    if (!MIKROTIK_ENABLED || !ip) return null;
+    const ipPropre = String(ip).replace(/^::ffff:/, "").trim();
+    const sources = [
+        ["/ip/arp/print", `?address=${ipPropre}`],
+        ["/ip/dhcp-server/lease/print", `?address=${ipPropre}`],
+    ];
+    for (const [chemin, filtre] of sources) {
+        try {
+            const res = await mikrotikCommand([chemin, filtre]);
+            const mac = normaliserMac(res.data?.[0]?.["mac-address"]);
+            if (mac) return mac;
+        } catch { /* source suivante */ }
+    }
+    return null;
+}
+
 async function creerUtilisateurHotspot(code, profilNom, duree, mac, quota) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
@@ -328,8 +351,11 @@ async function creerUtilisateurHotspot(code, profilNom, duree, mac, quota) {
             `=profile=${profilNom}`,
             `=limit-uptime=${dureesMK}`,
         ];
-        // Aucune restriction MAC : le code est utilisable sur tout appareil.
-        // (la libération de la connexion au changement de MAC est ainsi évitée)
+        // Forfaits gratuits uniquement : si une MAC est fournie, RouterOS
+        // n'acceptera la connexion de cet utilisateur que depuis cet appareil.
+        // Les forfaits payants passent mac=null → aucun changement de comportement.
+        const macMK = normaliserMac(mac);
+        if (macMK) words.push(`=mac-address=${macMK}`);
 
         // Limiter le volume total (ex: 500 Mo). RouterOS coupe l'abonné dès
         // que quota_in + quota_out atteint cette valeur, même après reconnexion.
@@ -469,6 +495,37 @@ async function listerHotspots() {
 }
 
 /**
+ * S'assurer que "mac" figure dans le login-by des profils serveur hotspot
+ * utilisés. Sans cela, RouterOS affiche la page de login même pour les
+ * utilisateurs liés à une MAC — le bypass ne fonctionne pas.
+ */
+async function activerLoginByMac() {
+    const hs = await mikrotikCommand(["/ip/hotspot/print"]);
+    const profilsUtilises = new Set((hs.data || []).map(h => h.profile).filter(Boolean));
+    if (profilsUtilises.size === 0) return;
+
+    const profs = await mikrotikCommand(["/ip/hotspot/profile/print"]);
+    for (const p of profs.data || []) {
+        if (!profilsUtilises.has(p.name)) continue;
+        const loginBy = String(p["login-by"] || "");
+        const methods = loginBy.split(",").map(s => s.trim()).filter(Boolean);
+        const maj = [];
+        if (!methods.includes("mac")) {
+            // garder les méthodes existantes et ajouter mac
+            methods.push("mac");
+            maj.push(`=login-by=${methods.join(",")}`);
+        }
+        if (p["open-status-page"] !== "http-login") {
+            // éviter la popup de statut après un login MAC automatique
+            maj.push("=open-status-page=http-login");
+        }
+        if (maj.length > 0) {
+            await mikrotikCommand(["/ip/hotspot/profile/set", `=.id=${p[".id"]}`, ...maj]);
+        }
+    }
+}
+
+/**
  * Ajouter une adresse MAC en bypass hotspot (accès sans portail captif)
  * Utilise /ip/hotspot/user avec le profil "bypass" ou crée un utilisateur sans limite
  * @param {string} mac - Adresse MAC (ex: AA:BB:CC:DD:EE:FF)
@@ -478,8 +535,8 @@ async function listerHotspots() {
 async function ajouterMacBypass(mac, nom, debit) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
-        // Normaliser la MAC au format Mikrotik (minuscules avec tirets)
-        const macMK = mac.toLowerCase().replace(/:/g, ":");
+        // Normaliser la MAC au format Mikrotik (minuscules)
+        const macMK = normaliserMac(mac).toLowerCase();
 
         // Vérifier si l'entrée existe déjà
         const existing = await mikrotikCommand([
@@ -496,23 +553,30 @@ async function ajouterMacBypass(mac, nom, debit) {
                 "/ip/hotspot/user/set",
                 `=.id=${id}`,
                 `=comment=Compte privilégié: ${nom}`,
+                // Avec le mac-auth-mode par défaut (mac-as-username-and-password),
+                // RouterOS attend le MAC comme mot de passe de l'utilisateur
+                `=password=${macMK}`,
             ];
             if (rateLimit) words.push(`=rate-limit=${rateLimit}`);
             await mikrotikCommand(words);
-            return { success: true, message: `Bypass MAC "${mac}" mis à jour sur Mikrotik pour "${nom}"` };
         } else {
-            // Créer un utilisateur hotspot avec la MAC (pas de mot de passe = bypass)
+            // Créer un utilisateur hotspot avec la MAC (auto-login par MAC)
             const words = [
                 "/ip/hotspot/user/add",
                 `=name=${macMK}`,
                 `=mac-address=${macMK}`,
                 `=comment=Compte privilégié: ${nom}`,
-                `=password=`,
+                `=password=${macMK}`,
             ];
             if (rateLimit) words.push(`=rate-limit=${rateLimit}`);
             await mikrotikCommand(words);
-            return { success: true, message: `Bypass MAC "${mac}" ajouté sur Mikrotik pour "${nom}" — accès sans portail captif activé` };
         }
+
+        // Point critique : sans "mac" dans le login-by du profil serveur
+        // hotspot, RouterOS affiche quand même la page de login.
+        await activerLoginByMac();
+
+        return { success: true, message: `Bypass MAC "${mac}" activé sur Mikrotik pour "${nom}" — accès sans portail captif (login-by=mac vérifié)` };
     } catch (err) {
         return { success: false, message: `Erreur Mikrotik bypass: ${err.message}` };
     }
@@ -525,7 +589,7 @@ async function ajouterMacBypass(mac, nom, debit) {
 async function supprimerMacBypass(mac) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
-        const macMK = mac.toLowerCase().replace(/:/g, ":");
+        const macMK = normaliserMac(mac).toLowerCase();
 
         const existing = await mikrotikCommand([
             "/ip/hotspot/user/print",
@@ -694,7 +758,7 @@ async function creerHotspot(opts) {
         // 5. Profil serveur hotspot (créé seulement si l'admin n'en choisit pas un existant)
         //    Note : ce RouterOS n'accepte pas le paramètre `comment` sur le profil.
         if (!opts.profilServer) {
-            await mikrotikCommand(["/ip/hotspot/profile/add", `=name=${profilNom}`, `=hotspot-address=${reseau.gateway}`, `=login-by=cookie,http-chap,http-pap`, `=html-directory=hotspot`]);
+            await mikrotikCommand(["/ip/hotspot/profile/add", `=name=${profilNom}`, `=hotspot-address=${reseau.gateway}`, `=login-by=cookie,mac,http-chap,http-pap`, `=open-status-page=http-login`, `=html-directory=hotspot`]);
         }
         // 6. Serveur hotspot (pas de `comment` supporté non plus)
         await mikrotikCommand(["/ip/hotspot/add", `=name=${nom}`, `=interface=${iface}`, `=address-pool=${poolNom}`, `=profile=${profilNom}`, `=disabled=no`]);
@@ -784,6 +848,7 @@ module.exports = {
     creerUtilisateurHotspot,
     supprimerUtilisateurHotspot,
     definirMacUtilisateurHotspot,
+    macDepuisIp,
     retirerSessionActiveParId,
     deconnecterClient,
     informationsUtilisateurHotspot,

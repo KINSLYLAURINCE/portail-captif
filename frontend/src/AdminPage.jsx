@@ -527,8 +527,13 @@ function ComptePrivilegie({ token }) {
     }
     setLoading(true);
     try {
-      await axios.post("/api/admin/comptes-privilegies", form, { headers: { Authorization: `Bearer ${token}` } });
-      showMsg(`Compte privilégié "${form.nom}" ajouté ! Accès internet sans portail captif activé.`);
+      const r = await axios.post("/api/admin/comptes-privilegies", form, { headers: { Authorization: `Bearer ${token}` } });
+      const mk = r.data.mikrotik;
+      if (mk && !mk.success) {
+        showMsg(`Compte enregistré, MAIS la synchro Mikrotik a échoué : ${mk.message}. L'appareil ne sera pas bypassé tant que le Mikrotik n'est pas joignable.`, "error");
+      } else {
+        showMsg(`Compte privilégié "${form.nom}" ajouté ! Accès internet sans portail captif activé.`);
+      }
       setForm({ nom: "", telephone: "", mac: "", debit: "Illimité", commentaire: "" });
       charger();
     } catch (err) {
@@ -541,7 +546,12 @@ function ComptePrivilegie({ token }) {
   const handleToggle = async (id) => {
     try {
       const r = await axios.patch(`/api/admin/comptes-privilegies/${id}/toggle`, {}, { headers: { Authorization: `Bearer ${token}` } });
-      showMsg(r.data.message);
+      const mk = r.data.mikrotik;
+      if (mk && !mk.success) {
+        showMsg(`Statut mis à jour en base, MAIS Mikrotik : ${mk.message}`, "error");
+      } else {
+        showMsg(r.data.message);
+      }
       charger();
     } catch { showMsg("Erreur.", "error"); }
   };
@@ -549,8 +559,13 @@ function ComptePrivilegie({ token }) {
   const handleSupprimer = async (id, nom) => {
     if (!window.confirm(`Supprimer le compte privilégié "${nom}" ?\nCet appareil devra repasser par le portail captif.`)) return;
     try {
-      await axios.delete(`/api/admin/comptes-privilegies/${id}`, { headers: { Authorization: `Bearer ${token}` } });
-      showMsg(`"${nom}" supprimé. Accès portail captif rétabli.`);
+      const r = await axios.delete(`/api/admin/comptes-privilegies/${id}`, { headers: { Authorization: `Bearer ${token}` } });
+      const mk = r.data.mikrotik;
+      if (mk && !mk.success) {
+        showMsg(`Compte supprimé de la base, MAIS Mikrotik : ${mk.message}. Vérifiez le routeur.`, "error");
+      } else {
+        showMsg(`"${nom}" supprimé. Accès portail captif rétabli.`);
+      }
       charger();
     } catch { showMsg("Erreur.", "error"); }
   };

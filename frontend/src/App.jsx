@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams, Routes, Route, useLocation } from "react-router-dom";
 import axios from "axios";
 import "./App.css";
@@ -170,6 +170,9 @@ const LANGS = {
     choisirForfait: "Choisissez votre forfait",
     selectionner: "Sélectionnez le forfait qui vous convient",
     payer: "💳 Payer par Mobile Money",
+    connecterGratuit: "🎁 Se connecter gratuitement",
+    gratuitLabel: "🎁 Gratuit",
+    gratuitDejaUtilise: "Ce forfait gratuit a déjà été utilisé sur cet appareil.",
     retour: "← Retour",
     paiementMM: "Paiement Mobile Money",
     confirmer: "Confirmer le paiement",
@@ -245,6 +248,9 @@ const LANGS = {
     choisirForfait: "Choose your plan",
     selectionner: "Select the plan that suits you",
     payer: "💳 Pay by Mobile Money",
+    connecterGratuit: "🎁 Connect for free",
+    gratuitLabel: "🎁 Free",
+    gratuitDejaUtilise: "This free plan has already been used on this device.",
     retour: "← Back",
     paiementMM: "Mobile Money Payment",
     confirmer: "Confirm payment",
@@ -562,12 +568,36 @@ function PageForfaits({ lang, setLang }) {
   const [loading, setLoading] = useState(true);
   const [erreur, setErreur] = useState("");
   const [selection, setSelection] = useState(null);
+  const [enCours, setEnCours] = useState(false);
 
   useEffect(() => {
     axios.get("/api/forfaits")
       .then(r => { setForfaits(r.data.forfaits); setLoading(false); })
       .catch(() => { setErreur(t.erreurForfaits); setLoading(false); });
   }, []);
+
+  // Forfait gratuit → accès direct (pas de paiement, pas de portail captif)
+  const handleAction = async () => {
+    if (!selection) return;
+    if (!selection.gratuit) {
+      navigate(`/paiement/${selection.id}`);
+      return;
+    }
+    setEnCours(true);
+    setErreur("");
+    try {
+      const r = await axios.post("/api/acces-gratuit", { forfaitId: selection.id, deviceId: getDeviceId(), mac: getMac() });
+      if (r.data.success && r.data.ticket) {
+        navigate(`/tickets/${encodeURIComponent(r.data.ticket.code)}`, { state: { autoConnect: true } });
+      } else {
+        setErreur(r.data.message || t.gratuitDejaUtilise);
+      }
+    } catch (err) {
+      setErreur(err.response?.data?.message || t.gratuitDejaUtilise);
+    } finally {
+      setEnCours(false);
+    }
+  };
 
   // Déterminer le forfait "populaire" (le plus cher parmi les actifs, ou le 2e)
   const forfaitPopulaireId = forfaits.length >= 2
@@ -605,7 +635,9 @@ function PageForfaits({ lang, setLang }) {
                 <div className="badge-populaire">{t.populaire}</div>
               )}
               <div className="forfait-nom">{f.nom}</div>
-              <div className="forfait-prix">{f.prix.toLocaleString()} <span>FCFA</span></div>
+              {f.gratuit
+                ? <div className="forfait-prix">{t.gratuitLabel}</div>
+                : <div className="forfait-prix">{f.prix.toLocaleString()} <span>FCFA</span></div>}
               <div className="forfait-details">
                 {f.duree  && <span>⏱️ {f.duree}</span>}
                 {f.quota  && <span>📦 {f.quota}</span>}
@@ -618,12 +650,12 @@ function PageForfaits({ lang, setLang }) {
 
         {selection && (
           <div className="selection-recap">
-            <strong>{t.forfait} :</strong> {selection.nom} — <strong className="prix-recap">{selection.prix.toLocaleString()} FCFA</strong>
+            <strong>{t.forfait} :</strong> {selection.nom} — <strong className="prix-recap">{selection.gratuit ? t.gratuitLabel : `${selection.prix.toLocaleString()} FCFA`}</strong>
           </div>
         )}
 
-        <button className="btn-primary" onClick={() => navigate(`/paiement/${selection.id}`)} disabled={!selection}>
-          {t.payer}
+        <button className="btn-primary" onClick={handleAction} disabled={!selection || enCours}>
+          {selection?.gratuit ? (enCours ? t.chargement : t.connecterGratuit) : t.payer}
         </button>
         <button className="btn-secondary" onClick={() => navigate("/")}>{t.retour}</button>
         <footer>© 2026 SMD-CONNECT</footer>
@@ -1037,6 +1069,9 @@ function PageTicket({ lang, setLang }) {
   const t = LANGS[lang];
   const navigate = useNavigate();
   const { code } = useParams();
+  const location = useLocation();
+  const autoConnect = location.state?.autoConnect === true;
+  const autoConnectFait = useRef(false);
   const [ticket, setTicket] = useState(null);
   const [forfait, setForfait] = useState(null);
   const [chargement, setChargement] = useState(true);
@@ -1084,6 +1119,29 @@ function PageTicket({ lang, setLang }) {
       return () => clearInterval(timer);
     }
   }, [connecte]);
+
+  // Connexion automatique après un accès gratuit (sans passer par le portail captif)
+  useEffect(() => {
+    if (!autoConnect || autoConnectFait.current) return;
+    if (!ticket || !forfait) return;
+    autoConnectFait.current = true;
+    (async () => {
+      setLoading(true);
+      setMessage("");
+      try {
+        const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId, deviceId: getDeviceId(), mac: getMac() });
+        setForfaitInfo({ nom: response.data.forfait, quota: response.data.quota, debit: response.data.debit });
+        setMessage(response.data.message);
+        setMessageType("success");
+        setConnecte(true);
+      } catch (error) {
+        setMessage(error.response?.data?.message || "Impossible de contacter le serveur.");
+        setMessageType("error");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [autoConnect, ticket, forfait]);
 
   if (chargement) {
     return (

@@ -139,9 +139,11 @@ CREATE TABLE IF NOT EXISTS parametres (
 CREATE TABLE IF NOT EXISTS appareils_gratuits (
     id               SERIAL PRIMARY KEY,
     appareil_id      TEXT NOT NULL,
+    mac              VARCHAR(20),
     forfait_id       INTEGER NOT NULL REFERENCES forfaits(id) ON DELETE CASCADE,
     ticket_code      VARCHAR(20),
     ip               VARCHAR(45),
     date_utilisation TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (appareil_id, forfait_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id);

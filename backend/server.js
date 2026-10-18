@@ -115,6 +115,27 @@ function genDeviceId(ip, userAgent, deviceId) {
     return `${ip}|${ua}`;
 }
 
+const MAC_REGEX = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/i;
+
+function normaliserMac(mac) {
+    if (!mac) return null;
+    const m = String(mac).trim().toUpperCase().replace(/-/g, ":");
+    return MAC_REGEX.test(m) ? m : null;
+}
+
+/**
+ * Résoudre l'adresse MAC réelle d'un client — uniquement pour les forfaits
+ * GRATUITS. Source : Mikrotik (ARP puis bail DHCP, non falsifiable) → mac
+ * fournie par le client (localStorage, issue de la redirection hotspot) → null.
+ */
+async function resolverMac(ip, macClient) {
+    try {
+        const macReelle = normaliserMac(await mk.macDepuisIp(ip));
+        if (macReelle) return macReelle;
+    } catch { /* Mikrotik injoignable → repli */ }
+    return normaliserMac(macClient);
+}
+
 /**
  * Restriction appareil SUPPRIMÉE : un ticket peut être utilisé sur n'importe
  * quel appareil. La MAC/navigateur ne servent plus qu'à titre indicatif (le
@@ -396,9 +417,9 @@ app.get("/api/ticket-etat/:code", rateLimit(30, 60000), async (req, res) => {
     }
 });
 
-// ─── Accès gratuit (forfait gratuit, 1 seul appareil, non renouvelable) ───
+// ─── Accès gratuit (forfait gratuit, 1 seul appareil identifié par MAC, non renouvelable) ───
 app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
-    const { forfaitId, deviceId } = req.body;
+    const { forfaitId, deviceId, mac } = req.body;
     if (!forfaitId || !deviceId) return res.status(400).json({ success: false, message: "Forfait et identifiant appareil requis." });
 
     const forfaitRes = await pool.query(
@@ -411,11 +432,18 @@ app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
     const ip = req.ip || "inconnu";
     const userAgent = req.headers["user-agent"] || "";
     const appareilId = genDeviceId(ip, userAgent, deviceId);
+    // MAC réelle du client (MikroTik ARP/DHCP) ; repli sur la mac client,
+    // puis deviceId si aucune MAC n'est résoluble (jamais de blocage à tort).
+    const macNorm = await resolverMac(ip, mac);
 
-    // Vérifier si cet appareil a déjà utilisé ce forfait gratuit (non renouvelable)
+    // Vérifier si cet appareil (par MAC si connue, sinon par deviceId) a déjà
+    // utilisé ce forfait gratuit — non renouvelable, y compris après vidage du cache
     const dejaUtiliseRes = await pool.query(
-        "SELECT * FROM appareils_gratuits WHERE appareil_id = $1 AND forfait_id = $2",
-        [appareilId, forfait.id]
+        `SELECT * FROM appareils_gratuits
+         WHERE forfait_id = $1
+           AND (($2::text IS NOT NULL AND mac = $2) OR appareil_id = $3)
+         LIMIT 1`,
+        [forfait.id, macNorm, appareilId]
     );
     if (dejaUtiliseRes.rows.length > 0) {
         const dejaUtilise = mapRow(dejaUtiliseRes.rows[0]);
@@ -429,29 +457,32 @@ app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
 
     // Vérifier si cet appareil a un ticket disponible en cours (pas encore connecté)
     const enCoursRes = await pool.query(
-        "SELECT * FROM tickets WHERE appareil_id = $1 AND forfait_id = $2 AND statut = 'disponible' ORDER BY id DESC LIMIT 1",
-        [appareilId, forfait.id]
+        `SELECT * FROM tickets
+         WHERE forfait_id = $1 AND statut = 'disponible'
+           AND (($2::text IS NOT NULL AND UPPER(mac) = $2) OR appareil_id = $3)
+         ORDER BY id DESC LIMIT 1`,
+        [forfait.id, macNorm, appareilId]
     );
     if (enCoursRes.rows.length > 0) {
         const ticketEnCours = mapRow(enCoursRes.rows[0]);
         return res.status(200).json({ success: true, ticket: ticketEnCours, forfait, existant: true });
     }
 
-    // Créer le ticket gratuit
+    // Créer le ticket gratuit (lié à la MAC quand elle est connue)
     const tRes = await pool.query(
-        `INSERT INTO tickets (code, forfait_id, forfait_nom, prix, statut, ip_achat, appareil_id, gratuit)
-         VALUES ($1, $2, $3, 0, 'disponible', $4, $5, true) RETURNING *`,
-        [genCode(), forfait.id, forfait.nom, ip, appareilId]
+        `INSERT INTO tickets (code, forfait_id, forfait_nom, prix, statut, ip_achat, appareil_id, mac, gratuit)
+         VALUES ($1, $2, $3, 0, 'disponible', $4, $5, $6, true) RETURNING *`,
+        [genCode(), forfait.id, forfait.nom, ip, appareilId, macNorm]
     );
     const t = mapRow(tRes.rows[0]);
 
     // Enregistrer immédiatement l'appareil comme ayant utilisé ce forfait gratuit
     await pool.query(
-        "INSERT INTO appareils_gratuits (appareil_id, forfait_id, ticket_code, ip) VALUES ($1, $2, $3, $4)",
-        [appareilId, forfait.id, t.code, ip]
+        "INSERT INTO appareils_gratuits (appareil_id, mac, forfait_id, ticket_code, ip) VALUES ($1, $2, $3, $4, $5)",
+        [appareilId, macNorm, forfait.id, t.code, ip]
     );
 
-    await ajouterLog("ticket", `Accès GRATUIT accordé — ticket ${t.code} pour "${forfait.nom}" (appareil: ${ip}, durée: ${forfait.duree})`);
+    await ajouterLog("ticket", `Accès GRATUIT accordé — ticket ${t.code} pour "${forfait.nom}" (appareil: ${macNorm || ip}, durée: ${forfait.duree})`);
     return res.status(201).json({ success: true, ticket: t, forfait });
 });
 
@@ -500,9 +531,11 @@ app.post("/api/acheter", rateLimit(5, 60000), async (req, res) => {
 });
 
 // Connexion / reconnexion avec un code ticket existant.
-// Règles : un ticket est lié à UN SEUL appareil (celui du premier usage),
-// mais il reste réutilisable autant de fois que nécessaire tant que le temps
-// du forfait n'est pas écoulé.
+// Règles :
+//  - Forfaits PAYANTS : aucune restriction d'appareil, réutilisable tant que
+//    le temps du forfait n'est pas écoulé.
+//  - Forfaits GRATUITS : réservés à la MAC de l'appareil qui les a obtenus
+//    (contrôle ci-dessous + MAC liée à l'utilisateur Mikrotik au 1er usage).
 async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     const codeNorm = (code || "").trim().toUpperCase();
     const macNorm = mac ? mac.trim().toUpperCase() : null;
@@ -524,15 +557,24 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
         return { status: 403, body: { success: false, message: "Ce code a expiré." } };
     }
 
+    // ── Forfaits GRATUITS uniquement : contrôle par adresse MAC ──────────
+    // Un ticket gratuit est réservé à l'appareil (MAC) qui l'a obtenu. Les
+    // forfaits payants ne sont pas concernés (aucune restriction d'appareil).
+    let macTicket = normaliserMac(ticket.mac);
+    let macActuelle = null;
+    if (ticket.gratuit) {
+        macActuelle = await resolverMac(ip, mac);
+        if (macTicket && macActuelle && macTicket !== macActuelle) {
+            return { status: 403, body: { success: false, message: "Ce forfait gratuit est réservé à l'appareil (MAC) qui l'a obtenu." } };
+        }
+        if (!macTicket) macTicket = macActuelle;
+    }
+
     // Un seul appareil autorisé (premier usage ET reconnexion)
     const verifAppareil = verifierAppareil(ticket, ip, userAgent, deviceId, macNorm);
     if (!verifAppareil.autorise) {
         return { status: 403, body: { success: false, message: "Ce code est déjà utilisé sur un autre appareil." } };
     }
-
-    // Contrôle supplémentaire par adresse MAC (si le ticket est déjà lié à une MAC)
-    // NB : un changement de MAC (randomisation Wi-Fi) est toléré quand le
-    // navigateur est reconnu — voir verifierAppareil / rebindMac ci-dessous.
 
     // Ticket déjà utilisé → autoriser la reconnexion tant que le temps restant
     // sur Mikrotik n'est pas écoulé (sinon il est considéré expiré).
@@ -568,11 +610,12 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     if (forfaitRes.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
     const forfait = mapRow(forfaitRes.rows[0]);
 
-    // Mémoriser le premier appareil vu (indicatif uniquement, aucune restriction)
+    // Mémoriser le premier appareil vu (indicatif uniquement pour les payants ;
+    // pour les gratuits, la MAC résolue devient la référence du ticket)
     if (verifAppareil.lier) {
         await pool.query(
             "UPDATE tickets SET appareil_id = COALESCE(appareil_id, $1), ip_achat = COALESCE(ip_achat, $2), mac = COALESCE(mac, $3) WHERE id = $4",
-            [genDeviceId(ip, userAgent, deviceId), ip, mac || null, ticket.id]
+            [genDeviceId(ip, userAgent, deviceId), ip, ticket.gratuit ? macTicket : (mac || null), ticket.id]
         );
     }
 
@@ -595,11 +638,13 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
 
     // Activer le ticket sur Mikrotik (uniquement au premier usage, pour ne pas
     // remettre à zéro le temps restant d'un ticket déjà utilisé).
-    // Aucune adresse MAC n'est liée : le code marche sur n'importe quel appareil.
+    // Payants : aucune MAC liée (utilisable sur n'importe quel appareil).
+    // GRATUITS : la MAC est liée à l'utilisateur hotspot → RouterOS refuse
+    // la connexion depuis tout autre appareil, même avec le code en main.
     let mikrotikOk = false;
     if (mk.MIKROTIK_ENABLED && !reconnexion) {
         try {
-            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, null, forfait.quota);
+            const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, ticket.gratuit ? macTicket : null, forfait.quota);
             mikrotikOk = mkResult.success;
             if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code`);
         } catch (e) {
@@ -878,14 +923,20 @@ app.get("/api/admin/acces-gratuits", adminAuth, async (req, res) => {
 
 // Réinitialiser l'accès gratuit d'un appareil (permettre un nouvel accès)
 app.delete("/api/admin/acces-gratuits", adminAuth, async (req, res) => {
-    const { appareilId, forfaitId } = req.body;
-    if (!appareilId || !forfaitId) return res.status(400).json({ success: false, message: "appareilId et forfaitId requis." });
-    const delRes = await pool.query(
-        "DELETE FROM appareils_gratuits WHERE appareil_id = $1 AND forfait_id = $2 RETURNING ip",
-        [appareilId, parseInt(forfaitId)]
-    );
+    const { appareilId, forfaitId, mac } = req.body;
+    const macNorm = normaliserMac(mac);
+    if ((!appareilId && !macNorm) || !forfaitId) return res.status(400).json({ success: false, message: "mac ou appareilId, et forfaitId requis." });
+    const delRes = macNorm
+        ? await pool.query(
+            "DELETE FROM appareils_gratuits WHERE mac = $1 AND forfait_id = $2 RETURNING ip, appareil_id",
+            [macNorm, parseInt(forfaitId)]
+        )
+        : await pool.query(
+            "DELETE FROM appareils_gratuits WHERE appareil_id = $1 AND forfait_id = $2 RETURNING ip, appareil_id",
+            [appareilId, parseInt(forfaitId)]
+        );
     if (delRes.rowCount === 0) return res.status(404).json({ success: false, message: "Entrée introuvable." });
-    await ajouterLog("forfait", `Accès gratuit réinitialisé pour appareil ${delRes.rows[0].ip} — forfait ID ${forfaitId}`);
+    await ajouterLog("forfait", `Accès gratuit réinitialisé pour appareil ${macNorm || delRes.rows[0].appareil_id || delRes.rows[0].ip} — forfait ID ${forfaitId}`);
     return res.json({ success: true, message: "Accès gratuit réinitialisé. L'appareil peut de nouveau utiliser ce forfait." });
 });
 

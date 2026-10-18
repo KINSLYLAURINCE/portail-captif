@@ -154,12 +154,14 @@ CREATE TABLE IF NOT EXISTS parametres (
 CREATE TABLE IF NOT EXISTS appareils_gratuits (
     id               SERIAL PRIMARY KEY,
     appareil_id      TEXT NOT NULL,
+    mac              VARCHAR(20),
     forfait_id       INTEGER NOT NULL REFERENCES forfaits(id) ON DELETE CASCADE,
     ticket_code      VARCHAR(20),
     ip               VARCHAR(45),
     date_utilisation TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (appareil_id, forfait_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id);
 
 CREATE TABLE IF NOT EXISTS paiements_fapshi (
     id               SERIAL PRIMARY KEY,
@@ -213,6 +215,8 @@ async function initSchema() {
     // Migrations pour colonnes ajoutées après la création initiale
     await pool.query(`ALTER TABLE parametres ADD COLUMN IF NOT EXISTS password_hash TEXT`);
     await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS mac VARCHAR(20)`);
+    await pool.query(`ALTER TABLE appareils_gratuits ADD COLUMN IF NOT EXISTS mac VARCHAR(20)`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id)`);
 }
 
 async function initDb() {
