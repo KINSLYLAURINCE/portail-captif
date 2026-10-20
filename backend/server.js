@@ -212,13 +212,20 @@ async function macrosPriviligieesActives() {
     return rows.map(r => r.mac);
 }
 
+let dernierEtatBypass = "";
+
 async function synchroniserBypassFirewall() {
     try {
         if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
         if (process.env.MIKROTIK_BYPASS_MODE !== "on") return { success: false, message: "Bypass firewall inactif (MIKROTIK_BYPASS_MODE!=on)" };
         const macs = await macrosPriviligieesActives();
         const r = await mk.synchroniserAdresseBypass(macs);
-        if (r && !r.success) console.warn("⚠️  Bypass firewall:", r.message);
+        if (r && !r.success) {
+            console.warn("⚠️  Bypass firewall:", r.message);
+        } else if (r && r.message !== dernierEtatBypass) {
+            dernierEtatBypass = r.message;
+            console.log("🔐 Bypass firewall:", r.message);
+        }
         return r;
     } catch (err) {
         console.warn("⚠️  Bypass firewall sync:", err.message);
