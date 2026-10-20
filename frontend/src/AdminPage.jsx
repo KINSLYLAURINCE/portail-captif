@@ -752,7 +752,7 @@ function Clients({ token }) {
           <button className="filtre-btn actif" onClick={charger}><><RefreshCw size={14} /> Actualiser</></button>
         </div>
         <div className="table-wrapper"><table>
-          <thead><tr><th>IP</th><th>MAC</th><th>Forfait</th><th>Hotspot</th><th>Connecté depuis</th><th>Quota consommé</th><th>Débit</th><th>Actions</th></tr></thead>
+          <thead><tr><th>IP</th><th>MAC</th><th>Forfait</th><th>Hotspot</th><th>Connecté depuis</th><th>Data consommée (cumul)</th><th>Débit</th><th>Actions</th></tr></thead>
           <tbody>{clients.length === 0 ? <tr><td colSpan="8" className="empty-msg">Aucun client connecté.</td></tr> : clients.map(c => (
             <tr key={c.id || c.ip}>
               <td className="code-cell">{c.ip}</td>

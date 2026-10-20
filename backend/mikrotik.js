@@ -469,6 +469,24 @@ async function listerClientsActifs() {
 }
 
 /**
+ * Lister les utilisateurs hotspot avec leurs compteurs CUMULÉS
+ * (bytes-in + bytes-out depuis la création du user, contrairement aux
+ * compteurs de session de /ip/hotspot/active qui repartent à zéro).
+ */
+async function listerUtilisateursHotspot() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", data: [] };
+    try {
+        const result = await mikrotikCommand([
+            "/ip/hotspot/user/print",
+            "=.proplist=name,bytes-in,bytes-out,limit-bytes-total",
+        ]);
+        return { success: true, data: result.data || [] };
+    } catch (err) {
+        return { success: false, message: err.message, data: [] };
+    }
+}
+
+/**
  * Lister les profils Hotspot sur Mikrotik
  */
 async function listerProfils() {
@@ -1002,6 +1020,7 @@ module.exports = {
     deconnecterClient,
     informationsUtilisateurHotspot,
     listerClientsActifs,
+    listerUtilisateursHotspot,
     listerProfils,
     listerHotspots,
     ajouterMacBypass,

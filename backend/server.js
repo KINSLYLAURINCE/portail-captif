@@ -1098,8 +1098,17 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
     try {
         if (mk.MIKROTIK_ENABLED) {
             const actifs = await mk.listerClientsActifs();
+            // Cumul par utilisateur depuis la création du ticket : c'est ce
+            // compteur (et pas celui de la session) qui pilote la coupure quota.
+            const cumuls = new Map();
+            const users = await mk.listerUtilisateursHotspot();
+            for (const u of (users.data || [])) {
+                if (u.name) cumuls.set(u.name, (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0));
+            }
             for (const c of (actifs.data || [])) {
-                const total = (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
+                const total = cumuls.has(c.user)
+                    ? cumuls.get(c.user)
+                    : (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
                 resultats.push({
                     ip: c.address,
                     mac: c["mac-address"] || null,
