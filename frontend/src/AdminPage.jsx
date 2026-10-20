@@ -498,10 +498,8 @@ function Domicile({ token }) {
 function ComptePrivilegie({ token }) {
   const [comptes, setComptes] = useState([]);
   const [msg, setMsg] = useState({ text: "", type: "" });
-  const [form, setForm] = useState({ nom: "", telephone: "", mac: "", debit: "Illimité", commentaire: "" });
+  const [form, setForm] = useState({ nom: "", mac: "" });
   const [loading, setLoading] = useState(false);
-
-  const debits = ["1 Mbps","2 Mbps","5 Mbps","10 Mbps","20 Mbps","50 Mbps","100 Mbps","Illimité"];
 
   const showMsg = (text, type = "success") => {
     setMsg({ text, type });
@@ -517,8 +515,8 @@ function ComptePrivilegie({ token }) {
 
   const handleAjouter = async (e) => {
     e.preventDefault();
-    if (!form.nom.trim() || !form.mac.trim()) {
-      showMsg("Nom et adresse MAC requis.", "error"); return;
+    if (!form.mac.trim()) {
+      showMsg("Adresse MAC requise.", "error"); return;
     }
     // Validation format MAC
     const macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
@@ -532,9 +530,9 @@ function ComptePrivilegie({ token }) {
       if (mk && !mk.success) {
         showMsg(`Compte enregistré, MAIS la synchro Mikrotik a échoué : ${mk.message}. L'appareil ne sera pas bypassé tant que le Mikrotik n'est pas joignable.`, "error");
       } else {
-        showMsg(`Compte privilégié "${form.nom}" ajouté ! Accès internet sans portail captif activé.`);
+        showMsg(`Compte privilégié "${r.data.compte.nom}" ajouté ! Accès internet sans portail captif activé.`);
       }
-      setForm({ nom: "", telephone: "", mac: "", debit: "Illimité", commentaire: "" });
+      setForm({ nom: "", mac: "" });
       charger();
     } catch (err) {
       showMsg(err.response?.data?.message || "Erreur.", "error");
@@ -607,15 +605,7 @@ function ComptePrivilegie({ token }) {
         <form onSubmit={handleAjouter}>
           <div className="form-row">
             <div className="form-group">
-              <label>Nom / Identifiant</label>
-              <input type="text" placeholder="Ex: Jean Dupont" value={form.nom} onChange={e => setForm({ ...form, nom: e.target.value })} />
-            </div>
-            <div className="form-group">
-              <label>Téléphone (optionnel)</label>
-              <input type="tel" placeholder="Ex: +225 07 00 00 00" value={form.telephone} onChange={e => setForm({ ...form, telephone: e.target.value })} />
-            </div>
-            <div className="form-group">
-              <label>Adresse MAC de l'appareil</label>
+              <label>Adresse MAC de l'appareil *</label>
               <input
                 type="text"
                 placeholder="Ex: AA:BB:CC:DD:EE:FF"
@@ -625,14 +615,8 @@ function ComptePrivilegie({ token }) {
               />
             </div>
             <div className="form-group">
-              <label>Débit autorisé</label>
-              <select value={form.debit} onChange={e => setForm({ ...form, debit: e.target.value })}>
-                {debits.map(d => <option key={d}>{d}</option>)}
-              </select>
-            </div>
-            <div className="form-group">
-              <label>Commentaire (optionnel)</label>
-              <input type="text" placeholder="Ex: Employé, Partenaire..." value={form.commentaire} onChange={e => setForm({ ...form, commentaire: e.target.value })} />
+              <label>Nom (optionnel)</label>
+              <input type="text" placeholder="Ex: Jean Dupont" value={form.nom} onChange={e => setForm({ ...form, nom: e.target.value })} />
             </div>
             <div className="form-group form-btn">
               <button type="submit" disabled={loading}>{loading ? "..." : "Ajouter"}</button>

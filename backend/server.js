@@ -1708,19 +1708,25 @@ app.get("/api/admin/comptes-privilegies", adminAuth, async (req, res) => {
 
 // Ajouter un compte privilégié (bypass portail captif par MAC)
 app.post("/api/admin/comptes-privilegies", adminAuth, async (req, res) => {
-    const { nom, telephone, mac, debit, commentaire } = req.body;
-    if (!nom || !mac) return res.status(400).json({ success: false, message: "Nom et adresse MAC requis." });
+    const { nom, mac } = req.body;
+    if (!mac) return res.status(400).json({ success: false, message: "Adresse MAC requise." });
 
-    const macNorm = mac.trim().toUpperCase();
+    const macNorm = mac.trim().toUpperCase().replace(/-/g, ":");
+    if (!/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(macNorm)) {
+        return res.status(400).json({ success: false, message: "Format MAC invalide. Ex: AA:BB:CC:DD:EE:FF" });
+    }
 
     // Vérifier doublon MAC
     const dup = await pool.query("SELECT 1 FROM comptes_privilegies WHERE mac = $1", [macNorm]);
     if (dup.rowCount > 0) return res.status(409).json({ success: false, message: "Cette adresse MAC est déjà enregistrée comme compte privilégié." });
 
+    // Nom optionnel — auto-généré depuis la MAC si absent
+    const nomFinal = (nom && nom.trim()) || `Appareil ${macNorm}`;
+
     const cRes = await pool.query(
         `INSERT INTO comptes_privilegies (nom, telephone, mac, debit, commentaire, statut)
          VALUES ($1, $2, $3, $4, $5, 'actif') RETURNING *`,
-        [nom.trim(), telephone?.trim() || "", macNorm, debit || "Illimité", commentaire?.trim() || ""]
+        [nomFinal, "", macNorm, "Illimité", ""]
     );
     const c = mapRow(cRes.rows[0]);
     await ajouterLog("privilege", `Compte privilégié "${c.nom}" (${c.mac}) ajouté — bypass portail captif activé`);
