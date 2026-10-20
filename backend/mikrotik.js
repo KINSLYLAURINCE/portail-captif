@@ -604,6 +604,158 @@ async function supprimerMacBypass(mac) {
     }
 }
 
+// ─── Bypass firewall (address-list) ───────────────────────────────────────
+// Architecture retenue par le conseil claude-council du 2026-10-20 (sha 55fdb9e4)
+// après 4 échecs du login-by=mac : accepter le trafic des MAC privilégiées AVANT
+// les chaînes hotspot, plutôt que de dépendre d'une authentification qui ne se
+// déclenche jamais. Leur IP (bail DHCP) est mise dans l'address-list "smd-bypass",
+// consommée par 3 règles "return" placées en tête des chaînes hotspot :
+//   1) /ip firewall nat    chain=hs-unauth     src-address-list=smd-bypass → return
+//      (stoppe le redirect portail 80/443/8080/3128)
+//   2) /ip firewall filter chain=hs-unauth     src-address-list=smd-bypass → return
+//      (stoppe les reject tcp-reset / icmp-host-prohibited sortants)
+//   3) /ip firewall filter chain=hs-unauth-to  dst-address-list=smd-bypass → return
+//      (stoppe les reject des retours internet → client)
+// Les règles ne matchent QUE les membres de la liste : les flux gratuits/payants
+// ne traversent aucune règle modifiée. Rollback : MIKROTIK_BYPASS_MODE=off +
+// restart → retirerBypassFirewall(). Limite connue : le trafic bypassé n'a pas
+// de session hotspot → rate-limit / quotas du profil non appliqués (comptes
+// privilégiés = illimités par conception).
+
+const BYPASS_LISTE = "smd-bypass";
+const BYPASS_TAG = "smd-bypass";
+
+/**
+ * Crée (idempotent) les 3 règles de bypass en tête des chaînes hotspot.
+ */
+async function initierBypassFirewall() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    const defs = [
+        { table: "/ip/firewall/nat",    chain: "hs-unauth",    champ: "src-address-list" },
+        { table: "/ip/firewall/filter", chain: "hs-unauth",    champ: "src-address-list" },
+        { table: "/ip/firewall/filter", chain: "hs-unauth-to", champ: "dst-address-list" },
+    ];
+    try {
+        let creees = 0;
+        for (const d of defs) {
+            const rules = await mikrotikCommand([d.table + "/print"]);
+            const deja = (rules.data || []).some(
+                r => r.chain === d.chain && String(r.comment || "") === BYPASS_TAG
+            );
+            if (deja) continue;
+            // En tête de la chaîne (première règle réellement évaluée)
+            const premier = (rules.data || []).find(r => r.chain === d.chain);
+            const mots = [
+                d.table + "/add",
+                `=chain=${d.chain}`,
+                "=action=return",
+                `=${d.champ}=${BYPASS_LISTE}`,
+                `=comment=${BYPASS_TAG}`,
+            ];
+            if (premier) mots.push(`=place-before=${premier[".id"]}`);
+            await mikrotikCommand(mots);
+            creees++;
+        }
+        return {
+            success: true,
+            message: creees > 0 ? `${creees} règle(s) bypass firewall créée(s)` : "Règles bypass firewall déjà en place",
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur init bypass firewall: ${err.message}` };
+    }
+}
+
+/**
+ * Synchronise l'address-list smd-bypass avec les bails DHCP des MAC privilégiées.
+ * Toute entrée qui ne correspond plus à un bail "bound" d'une MAC privilégiée
+ * active est retirée (protection anti-réutilisation d'IP par un autre client).
+ * @param {string[]} macs - MACs privilégiées ACTIVES (format quelconque)
+ */
+async function synchroniserAdresseBypass(macs) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        await initierBypassFirewall();
+
+        const macsVoulues = new Set(
+            (macs || []).map(m => normaliserMac(m)).filter(Boolean).map(m => m.toLowerCase())
+        );
+
+        const leases = await mikrotikCommand(["/ip/dhcp-server/lease/print"]);
+        const voulues = new Map(); // ip -> mac
+        for (const l of leases.data || []) {
+            const macL = normaliserMac(l["mac-address"]);
+            if (l.status === "bound" && macL && l.address && macsVoulues.has(macL.toLowerCase())) {
+                voulues.set(l.address, macL.toLowerCase());
+            }
+        }
+
+        const actuelles = await mikrotikCommand([
+            "/ip/firewall/address-list/print", `?list=${BYPASS_LISTE}`,
+        ]);
+        const existantes = new Map(); // ip -> {id, comment}
+        for (const e of actuelles.data || []) {
+            if (e.address && e[".id"]) existantes.set(e.address, { id: e[".id"], comment: String(e.comment || "") });
+        }
+
+        let ajouts = 0, retraits = 0, corrections = 0;
+        for (const [ip, ent] of existantes) {
+            const macAttendue = voulues.get(ip);
+            if (!macAttendue) {
+                await mikrotikCommand(["/ip/firewall/address-list/remove", `=.id=${ent.id}`]);
+                retraits++;
+            } else if (ent.comment.toLowerCase() !== macAttendue) {
+                await mikrotikCommand(["/ip/firewall/address-list/set", `=.id=${ent.id}`, `=comment=${macAttendue}`]);
+                corrections++;
+            }
+        }
+        for (const [ip, macL] of voulues) {
+            if (!existantes.has(ip)) {
+                await mikrotikCommand([
+                    "/ip/firewall/address-list/add",
+                    `=list=${BYPASS_LISTE}`, `=address=${ip}`, `=comment=${macL}`,
+                ]);
+                ajouts++;
+            }
+        }
+
+        return {
+            success: true,
+            message: `Bypass firewall: ${voulues.size} MAC privilégiée(s) avec bail — ${ajouts} ajout(s), ${retraits} retrait(s), ${corrections} correction(s)`,
+            details: { dansListe: voulues.size, ajouts, retraits, corrections },
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur sync bypass firewall: ${err.message}` };
+    }
+}
+
+/**
+ * Retire les 3 règles et vide la liste (rollback complet, appelé quand
+ * MIKROTIK_BYPASS_MODE=off au démarrage).
+ */
+async function retirerBypassFirewall() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        let n = 0;
+        for (const table of ["/ip/firewall/nat", "/ip/firewall/filter"]) {
+            const rules = await mikrotikCommand([table + "/print"]);
+            for (const r of rules.data || []) {
+                if (String(r.comment || "") === BYPASS_TAG) {
+                    await mikrotikCommand([table + "/remove", `=.id=${r[".id"]}`]);
+                    n++;
+                }
+            }
+        }
+        const lst = await mikrotikCommand(["/ip/firewall/address-list/print", `?list=${BYPASS_LISTE}`]);
+        for (const e of lst.data || []) {
+            await mikrotikCommand(["/ip/firewall/address-list/remove", `=.id=${e[".id"]}`]);
+            n++;
+        }
+        return { success: true, message: `Bypass firewall retiré (${n} élément(s))` };
+    } catch (err) {
+        return { success: false, message: `Erreur retrait bypass firewall: ${err.message}` };
+    }
+}
+
 // ─── Gestion complète des serveurs Hotspot (création / suppression) ─────────
 
 function normaliserNomHotspot(nom) {
@@ -854,6 +1006,9 @@ module.exports = {
     listerHotspots,
     ajouterMacBypass,
     supprimerMacBypass,
+    initierBypassFirewall,
+    synchroniserAdresseBypass,
+    retirerBypassFirewall,
     listerInterfaces,
     listerProfilsServeur,
     creerHotspot,

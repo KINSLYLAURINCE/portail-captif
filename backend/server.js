@@ -182,6 +182,7 @@ async function ajouterBypassMikrotik(mac, nom, debit) {
     try {
         const debitMK = debit === "Illimité" ? "0" : debit.replace(" Mbps", "M").replace(" Kbps", "K");
         const result = await mk.ajouterMacBypass(mac, nom, debitMK);
+        if (result?.success) await synchroniserBypassFirewall();
         return result;
     } catch (err) {
         return { success: false, message: err.message };
@@ -192,8 +193,35 @@ async function supprimerBypassMikrotik(mac) {
     if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
         const result = await mk.supprimerMacBypass(mac);
+        if (result?.success) await synchroniserBypassFirewall();
         return result;
     } catch (err) {
+        return { success: false, message: err.message };
+    }
+}
+
+// ─── Bypass firewall (address-list) — conseil claude-council sha 55fdb9e4 ──
+// MIKROTIK_BYPASS_MODE :
+//   "on"  → 3 règles return sur les chaînes hotspot + address-list synchronisée
+//           toutes les 60 s (et après chaque création/suppression de compte)
+//   "off" → retrait complet des règles et de la liste au démarrage (rollback)
+//   absent → aucun changement (comportement historique conservé)
+
+async function macrosPriviligieesActives() {
+    const { rows } = await pool.query("SELECT mac FROM comptes_privilegies WHERE statut = 'actif'");
+    return rows.map(r => r.mac);
+}
+
+async function synchroniserBypassFirewall() {
+    try {
+        if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+        if (process.env.MIKROTIK_BYPASS_MODE !== "on") return { success: false, message: "Bypass firewall inactif (MIKROTIK_BYPASS_MODE!=on)" };
+        const macs = await macrosPriviligieesActives();
+        const r = await mk.synchroniserAdresseBypass(macs);
+        if (r && !r.success) console.warn("⚠️  Bypass firewall:", r.message);
+        return r;
+    } catch (err) {
+        console.warn("⚠️  Bypass firewall sync:", err.message);
         return { success: false, message: err.message };
     }
 }
@@ -2267,6 +2295,24 @@ app.use((err, req, res, next) => {
             console.log(`📡 Mikrotik: ${mk.MIKROTIK_ENABLED ? "✅ Activé (" + (process.env.MIKROTIK_HOST || "192.168.88.1") + ")" : "❌ Désactivé (MIKROTIK_ENABLED=false)"}`);
             console.log(`🔐 Admin: mot de passe hashé (bcrypt + JWT)`);
             console.log(`💾 Données: PostgreSQL (${process.env.PGDATABASE || "portail_captif"} @ ${process.env.PGHOST || "localhost"})\n`);
+
+            // ── Bypass firewall (address-list smd-bypass) ─────────────────────
+            const bypassMode = process.env.MIKROTIK_BYPASS_MODE || "";
+            if (bypassMode === "on") {
+                console.log("🔓 Bypass firewall (address-list smd-bypass) ACTIF — sync toutes les 60 s");
+                setTimeout(() => { synchroniserBypassFirewall(); }, 10000);
+                setInterval(() => { synchroniserBypassFirewall(); }, 60000);
+            } else if (bypassMode === "off") {
+                console.log("↩️  Bypass firewall: MIKROTIK_BYPASS_MODE=off — retrait des règles au démarrage");
+                setTimeout(async () => {
+                    try {
+                        const r = await mk.retirerBypassFirewall();
+                        if (r?.message) console.log("   " + r.message);
+                    } catch (e) {
+                        console.warn("⚠️  Retrait bypass firewall:", e.message);
+                    }
+                }, 10000);
+            }
         });
     } catch (e) {
         console.error("❌ Impossible de démarrer le serveur:", e.message);
