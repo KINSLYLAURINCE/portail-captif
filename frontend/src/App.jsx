@@ -28,6 +28,20 @@ function getMac() {
   return mac || null;
 }
 
+// ─── IP LAN du client (fournie par le routeur via ?ip=) — le backend s'en
+// sert pour résoudre la MAC réelle via ARP/DHCP Mikrotik ──────────────────
+function getClientIp() {
+  let ip = localStorage.getItem("smd_ip");
+  try {
+    const param = new URLSearchParams(window.location.search).get("ip");
+    if (param && /^\d{1,3}(\.\d{1,3}){3}$/.test(param.trim())) {
+      ip = param.trim();
+      localStorage.setItem("smd_ip", ip);
+    }
+  } catch {}
+  return ip || null;
+}
+
 // ─── Adresse de la passerelle hotspot (pour le POST /login du routeur) ────
 const GATEWAY_FALLBACK = "192.168.88.1";
 
@@ -438,7 +452,7 @@ function PageCodeExistant({ lang, setLang }) {
   useEffect(() => {
     const verifier = (c) => {
       if (!c) return;
-      axios.get(`/api/ticket-etat/${encodeURIComponent(c)}`, { params: { deviceId: getDeviceId(), mac: getMac() } })
+      axios.get(`/api/ticket-etat/${encodeURIComponent(c)}`, { params: { deviceId: getDeviceId(), mac: getMac(), clientIp: getClientIp() } })
         .then(r => {
           if (r.data.valide && r.data.memeAppareil !== false) {
             setCode(c);
@@ -451,7 +465,7 @@ function PageCodeExistant({ lang, setLang }) {
     if (dernier) {
       verifier(dernier);
     } else {
-      axios.get("/api/session", { params: { deviceId: getDeviceId(), mac: getMac() } })
+      axios.get("/api/session", { params: { deviceId: getDeviceId(), mac: getMac(), clientIp: getClientIp() } })
         .then(r => { if (r.data?.success && r.data.connecte && r.data.ticket) verifier(r.data.ticket); })
         .catch(() => {});
     }
@@ -488,7 +502,7 @@ function PageCodeExistant({ lang, setLang }) {
     setMessage("");
     try {
       const deviceId = getDeviceId();
-      const response = await axios.post("/api/login-code", { code: code.trim().toUpperCase(), deviceId, mac: getMac() });
+      const response = await axios.post("/api/login-code", { code: code.trim().toUpperCase(), deviceId, mac: getMac(), clientIp: getClientIp() });
       setForfaitInfo({
         nom: response.data.forfait,
         quota: response.data.quota,
@@ -586,7 +600,7 @@ function PageForfaits({ lang, setLang }) {
     setEnCours(true);
     setErreur("");
     try {
-      const r = await axios.post("/api/acces-gratuit", { forfaitId: selection.id, deviceId: getDeviceId(), mac: getMac() });
+      const r = await axios.post("/api/acces-gratuit", { forfaitId: selection.id, deviceId: getDeviceId(), mac: getMac(), clientIp: getClientIp() });
       if (r.data.success && r.data.ticket) {
         navigate(`/tickets/${encodeURIComponent(r.data.ticket.code)}`, { state: { autoConnect: true } });
       } else {
@@ -1129,7 +1143,7 @@ function PageTicket({ lang, setLang }) {
       setLoading(true);
       setMessage("");
       try {
-        const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId, deviceId: getDeviceId(), mac: getMac() });
+        const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId, deviceId: getDeviceId(), mac: getMac(), clientIp: getClientIp() });
         setForfaitInfo({ nom: response.data.forfait, quota: response.data.quota, debit: response.data.debit });
         setMessage(response.data.message);
         setMessageType("success");
@@ -1191,7 +1205,7 @@ function PageTicket({ lang, setLang }) {
     setLoading(true);
     setMessage("");
     try {
-      const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId, deviceId: getDeviceId(), mac: getMac() });
+      const response = await axios.post("/api/login", { ticket: ticket.code, forfaitId: ticket.forfaitId, deviceId: getDeviceId(), mac: getMac(), clientIp: getClientIp() });
       setForfaitInfo({
         nom: response.data.forfait,
         quota: response.data.quota,
@@ -1356,6 +1370,15 @@ function PageTickets({ lang, setLang }) {
 
 // ─── App principale ────────────────────────────────────────────────────────
 function App() {
+  // Capturer deviceId / MAC / IP LAN dès le montage, TANT QUE l'URL de
+  // redirection hotspot porte encore ?mac=&ip= (navigate() les purge).
+  useEffect(() => {
+    getDeviceId();
+    getMac();
+    getClientIp();
+    getGateway();
+  }, []);
+
   const [lang, setLangState] = useState(() => {
     const saved = localStorage.getItem("smd_lang");
     if (saved) return saved;

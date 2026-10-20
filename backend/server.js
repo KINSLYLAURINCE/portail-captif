@@ -33,6 +33,21 @@ function octetsLisible(n) {
     return `${v.toFixed(v >= 100 ? 0 : 1)} ${unites[i]}`;
 }
 
+// Secondes → "1j 3h 53m" / "48min" (affichage temps cumulé admin)
+function tempsLisible(sec) {
+    if (sec == null || isNaN(sec) || sec < 0) return null;
+    sec = Math.floor(sec);
+    if (sec === 0) return "0min";
+    const j = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (j > 0) return h > 0 ? `${j}j ${h}h` : `${j}j`;
+    if (h > 0) return m > 0 ? `${h}h ${m}min` : `${h}h`;
+    if (m > 0) return `${m}min`;
+    return `${s}s`;
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -116,6 +131,16 @@ function genDeviceId(ip, userAgent, deviceId) {
 }
 
 const MAC_REGEX = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/i;
+const IP_LAN_REGEX = /^(\d{1,3}\.){3}\d{1,3}$/;
+
+// IP LAN du client passée par le portail (redirection hotspot ?ip=) — sert
+// à résoudre la MAC via ARP/DHCP et à enregistrer une IP exploitable (contrairement
+// à req.ip qui vaut 127.0.0.1 derrière nginx).
+function ipLanClient(clientIp) {
+    if (!clientIp) return null;
+    const ip = String(clientIp).trim();
+    return IP_LAN_REGEX.test(ip) ? ip : null;
+}
 
 function normaliserMac(mac) {
     if (!mac) return null;
@@ -125,14 +150,24 @@ function normaliserMac(mac) {
 
 /**
  * Résoudre l'adresse MAC réelle d'un client — uniquement pour les forfaits
- * GRATUITS. Source : Mikrotik (ARP puis bail DHCP, non falsifiable) → mac
- * fournie par le client (localStorage, issue de la redirection hotspot) → null.
+ * GRATUITS. Sources, par ordre de fiabilité :
+ *   1. ARP/DHCP Mikrotik sur req.ip (quand le backend voit l'IP LAN réelle)
+ *   2. ARP/DHCP Mikrotik sur clientIp (IP LAN passée par le portail, issue
+ *      de la redirection hotspot ?ip=) — MAC non falsifiable
+ *   3. mac fournie par le client (URL ?mac=, localStorage) — falsifiable,
+ *      dernier recours
  */
-async function resolverMac(ip, macClient) {
+async function resolverMac(ip, macClient, clientIp) {
     try {
         const macReelle = normaliserMac(await mk.macDepuisIp(ip));
         if (macReelle) return macReelle;
     } catch { /* Mikrotik injoignable → repli */ }
+    if (clientIp && clientIp !== ip) {
+        try {
+            const macLan = normaliserMac(await mk.macDepuisIp(clientIp));
+            if (macLan) return macLan;
+        } catch { /* repli */ }
+    }
     return normaliserMac(macClient);
 }
 
@@ -454,7 +489,7 @@ app.get("/api/ticket-etat/:code", rateLimit(30, 60000), async (req, res) => {
 
 // ─── Accès gratuit (forfait gratuit, 1 seul appareil identifié par MAC, non renouvelable) ───
 app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
-    const { forfaitId, deviceId, mac } = req.body;
+    const { forfaitId, deviceId, mac, clientIp } = req.body;
     if (!forfaitId || !deviceId) return res.status(400).json({ success: false, message: "Forfait et identifiant appareil requis." });
 
     const forfaitRes = await pool.query(
@@ -465,11 +500,15 @@ app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
     const forfait = mapRow(forfaitRes.rows[0]);
 
     const ip = req.ip || "inconnu";
+    // IP LAN réelle du client (redirection hotspot ?ip=) — exploitable pour
+    // ARP/DHCP et les logs, contrairement à req.ip (127.0.0.1 derrière nginx).
+    const ipLan = ipLanClient(clientIp);
+    const ipEnregistree = ipLan || ip;
     const userAgent = req.headers["user-agent"] || "";
     const appareilId = genDeviceId(ip, userAgent, deviceId);
-    // MAC réelle du client (MikroTik ARP/DHCP) ; repli sur la mac client,
-    // puis deviceId si aucune MAC n'est résoluble (jamais de blocage à tort).
-    const macNorm = await resolverMac(ip, mac);
+    // MAC réelle du client (MikroTik ARP/DHCP via IP LAN) ; repli sur la mac
+    // client, puis deviceId si aucune MAC n'est résoluble.
+    const macNorm = await resolverMac(ip, mac, ipLan);
 
     // Vérifier si cet appareil (par MAC si connue, sinon par deviceId) a déjà
     // utilisé ce forfait gratuit — non renouvelable, y compris après vidage du cache
@@ -477,11 +516,37 @@ app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
         `SELECT * FROM appareils_gratuits
          WHERE forfait_id = $1
            AND (($2::text IS NOT NULL AND mac = $2) OR appareil_id = $3)
-         LIMIT 1`,
+         ORDER BY id DESC LIMIT 1`,
         [forfait.id, macNorm, appareilId]
     );
     if (dejaUtiliseRes.rows.length > 0) {
         const dejaUtilise = mapRow(dejaUtiliseRes.rows[0]);
+        // Reconnexion : si le ticket lié est encore actif (session en cours,
+        // non expirée), le retourner au lieu de bloquer l'appareil.
+        if (dejaUtilise.ticketCode) {
+            const encRes = await pool.query(
+                "SELECT * FROM tickets WHERE code = $1",
+                [dejaUtilise.ticketCode]
+            );
+            if (encRes.rows.length > 0) {
+                const ticketEncours = mapRow(encRes.rows[0]);
+                if (ticketEncours.statut === "disponible") {
+                    return res.status(200).json({ success: true, ticket: ticketEncours, forfait, existant: true });
+                }
+                if (ticketEncours.statut === "utilise") {
+                    const connRes = await pool.query(
+                        "SELECT debut, fin FROM connexions WHERE ticket = $1 ORDER BY id DESC LIMIT 1",
+                        [ticketEncours.code]
+                    );
+                    const conn = connRes.rows[0];
+                    const debut = conn?.debut ? new Date(conn.debut).getTime() : null;
+                    const expire = conn?.fin || (debut && dureeEnMs(forfait.duree) && (Date.now() - debut) > dureeEnMs(forfait.duree));
+                    if (!expire) {
+                        return res.status(200).json({ success: true, ticket: ticketEncours, forfait, existant: true });
+                    }
+                }
+            }
+        }
         return res.status(403).json({
             success: false,
             message: `Ce forfait gratuit a déjà été utilisé sur cet appareil le ${new Date(dejaUtilise.dateUtilisation).toLocaleDateString("fr-FR")}. Il n'est pas renouvelable.`,
@@ -507,17 +572,17 @@ app.post("/api/acces-gratuit", rateLimit(3, 60000), async (req, res) => {
     const tRes = await pool.query(
         `INSERT INTO tickets (code, forfait_id, forfait_nom, prix, statut, ip_achat, appareil_id, mac, gratuit)
          VALUES ($1, $2, $3, 0, 'disponible', $4, $5, $6, true) RETURNING *`,
-        [genCode(), forfait.id, forfait.nom, ip, appareilId, macNorm]
+        [genCode(), forfait.id, forfait.nom, ipEnregistree, appareilId, macNorm]
     );
     const t = mapRow(tRes.rows[0]);
 
     // Enregistrer immédiatement l'appareil comme ayant utilisé ce forfait gratuit
     await pool.query(
         "INSERT INTO appareils_gratuits (appareil_id, mac, forfait_id, ticket_code, ip) VALUES ($1, $2, $3, $4, $5)",
-        [appareilId, macNorm, forfait.id, t.code, ip]
+        [appareilId, macNorm, forfait.id, t.code, ipEnregistree]
     );
 
-    await ajouterLog("ticket", `Accès GRATUIT accordé — ticket ${t.code} pour "${forfait.nom}" (appareil: ${macNorm || ip}, durée: ${forfait.duree})`);
+    await ajouterLog("ticket", `Accès GRATUIT accordé — ticket ${t.code} pour "${forfait.nom}" (appareil: ${macNorm || ipEnregistree}, durée: ${forfait.duree})`);
     return res.status(201).json({ success: true, ticket: t, forfait });
 });
 
@@ -571,12 +636,19 @@ app.post("/api/acheter", rateLimit(5, 60000), async (req, res) => {
 //    le temps du forfait n'est pas écoulé.
 //  - Forfaits GRATUITS : réservés à la MAC de l'appareil qui les a obtenus
 //    (contrôle ci-dessous + MAC liée à l'utilisateur Mikrotik au 1er usage).
-async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
+async function connexionParCode({ code, deviceId, ip, userAgent, mac, clientIp }) {
     const codeNorm = (code || "").trim().toUpperCase();
     const macNorm = mac ? mac.trim().toUpperCase() : null;
+    // IP LAN réelle du client (redirection hotspot ?ip=) — utilisée pour
+    // résoudre la MAC (ARP/DHCP) et enregistrer une IP exploitable.
+    const ipLan = ipLanClient(clientIp);
+    const ipEnregistree = ipLan || ip;
 
     // Vérifier blacklist IP
-    const bloque = await pool.query("SELECT 1 FROM blacklist WHERE type = 'ip' AND valeur = $1", [ip]);
+    const bloque = await pool.query(
+        "SELECT 1 FROM blacklist WHERE type = 'ip' AND (valeur = $1 OR valeur = $2)",
+        [ip, ipEnregistree]
+    );
     if (bloque.rowCount > 0) {
         return { status: 403, body: { success: false, message: "Accès refusé." } };
     }
@@ -598,7 +670,7 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     let macTicket = normaliserMac(ticket.mac);
     let macActuelle = null;
     if (ticket.gratuit) {
-        macActuelle = await resolverMac(ip, mac);
+        macActuelle = await resolverMac(ip, mac, ipLan);
         if (macTicket && macActuelle && macTicket !== macActuelle) {
             return { status: 403, body: { success: false, message: "Ce forfait gratuit est réservé à l'appareil (MAC) qui l'a obtenu." } };
         }
@@ -650,14 +722,14 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     if (verifAppareil.lier) {
         await pool.query(
             "UPDATE tickets SET appareil_id = COALESCE(appareil_id, $1), ip_achat = COALESCE(ip_achat, $2), mac = COALESCE(mac, $3) WHERE id = $4",
-            [genDeviceId(ip, userAgent, deviceId), ip, ticket.gratuit ? macTicket : (mac || null), ticket.id]
+            [genDeviceId(ip, userAgent, deviceId), ipEnregistree, ticket.gratuit ? macTicket : (mac || null), ticket.id]
         );
     }
 
     // Enregistrer la connexion
     await pool.query(
         "INSERT INTO connexions (ticket, ip, forfait, montant) VALUES ($1, $2, $3, $4)",
-        [ticket.code, ip, forfait.nom, forfait.prix]
+        [ticket.code, ipEnregistree, forfait.nom, forfait.prix]
     );
 
     // Marquer le ticket comme utilisé
@@ -667,7 +739,7 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
     try {
         await pool.query(
             "INSERT INTO clients (ip, forfait, debut, statut) VALUES ($1, $2, now(), 'connecte') ON CONFLICT DO NOTHING",
-            [ip, forfait.nom]
+            [ipEnregistree, forfait.nom]
         );
     } catch {}
 
@@ -687,7 +759,7 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
         }
     }
 
-    await ajouterLog("connexion", `Client ${ip} connecté avec code ${ticket.code} — ${forfait.nom}${mikrotikOk ? " [MK OK]" : ""}`);
+    await ajouterLog("connexion", `Client ${ipEnregistree} connecté avec code ${ticket.code} — ${forfait.nom}${mikrotikOk ? " [MK OK]" : ""}`);
 
     return {
         status: 200,
@@ -705,12 +777,12 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac }) {
 
 // Connexion / reconnexion depuis le formulaire de code
 app.post("/api/login-code", rateLimit(10, 60000), async (req, res) => {
-    const { code, deviceId, mac } = req.body;
+    const { code, deviceId, mac, clientIp } = req.body;
     if (!code) return res.status(400).json({ success: false, message: "Code requis." });
     const ip = req.ip || "inconnu";
     const userAgent = req.headers["user-agent"] || "";
     try {
-        const { status, body } = await connexionParCode({ code, deviceId, ip, userAgent, mac });
+        const { status, body } = await connexionParCode({ code, deviceId, ip, userAgent, mac, clientIp });
         return res.status(status).json(body);
     } catch (err) {
         console.error("Erreur login-code:", err.message);
@@ -719,12 +791,12 @@ app.post("/api/login-code", rateLimit(10, 60000), async (req, res) => {
 });
 
 app.post("/api/login", async (req, res) => {
-    const { ticket, deviceId, mac } = req.body;
+    const { ticket, deviceId, mac, clientIp } = req.body;
     if (!ticket) return res.status(400).json({ success: false, message: "Veuillez entrer un code ticket." });
     const ip = req.ip || "inconnu";
     const userAgent = req.headers["user-agent"] || "";
     try {
-        const { status, body } = await connexionParCode({ code: ticket, deviceId, ip, userAgent, mac });
+        const { status, body } = await connexionParCode({ code: ticket, deviceId, ip, userAgent, mac, clientIp });
         return res.status(status).json(body);
     } catch (err) {
         console.error("Erreur login:", err.message);
@@ -1101,14 +1173,23 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
             // Cumul par utilisateur depuis la création du ticket : c'est ce
             // compteur (et pas celui de la session) qui pilote la coupure quota.
             const cumuls = new Map();
+            const tempsCumules = new Map();
             const users = await mk.listerUtilisateursHotspot();
             for (const u of (users.data || [])) {
-                if (u.name) cumuls.set(u.name, (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0));
+                if (!u.name) continue;
+                cumuls.set(u.name, (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0));
+                // u.uptime = temps de connexion CUMULÉ sur Mikrotik (reste
+                // après reconnexions) — ce que l'admin veut voir, pas l'uptime
+                // de la session en cours qui repart à zéro à chaque reconnexion.
+                tempsCumules.set(u.name, uptimeToSecondes(u.uptime));
             }
             for (const c of (actifs.data || [])) {
                 const total = cumuls.has(c.user)
                     ? cumuls.get(c.user)
                     : (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
+                const cumulSec = tempsCumules.has(c.user)
+                    ? tempsCumules.get(c.user)
+                    : uptimeToSecondes(c.uptime);
                 resultats.push({
                     ip: c.address,
                     mac: c["mac-address"] || null,
@@ -1116,6 +1197,8 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
                     hotspot: c.server || null,
                     debut: new Date(Date.now() - uptimeToSecondes(c.uptime) * 1000).toISOString(),
                     quotaConsomme: octetsLisible(total),
+                    tempsConsomme: tempsLisible(cumulSec),
+                    tempsCumulSec: cumulSec,
                     debit: null,
                     statut: "connecte",
                     source: "mikrotik"
@@ -2208,16 +2291,20 @@ async function verifierExpirations() {
                 // Marquer la connexion comme terminée
                 await pool.query("UPDATE connexions SET fin = now() WHERE id = $1", [c.id]);
 
-                // Déconnecter le client sur Mikrotik
-                if (mk.MIKROTIK_ENABLED && c.ip) {
+                // Déconnecter la session sur Mikrotik PAR TICKET (fiable —
+                // l'IP en base vaut ::ffff:127.0.0.1 derrière nginx, le kick
+                // par adresse ne trouvait rien et la session tournait jusqu'au
+                // plafond limit-uptime). Ensuite seulement supprimer le user.
+                if (mk.MIKROTIK_ENABLED) {
                     try {
-                        await mk.deconnecterClient(c.ip);
-                        // Supprimer l'utilisateur hotspot du ticket expiré
                         if (c.ticket) {
+                            await mk.deconnecterSessionParUtilisateur(c.ticket);
                             await mk.supprimerUtilisateurHotspot(c.ticket);
+                        } else {
+                            await mk.deconnecterClient(c.ip);
                         }
                     } catch (e) {
-                        console.error(`Mikrotik disconnect ${c.ip} error:`, e.message);
+                        console.error(`Mikrotik disconnect ${c.ticket || c.ip} error:`, e.message);
                     }
                 }
 

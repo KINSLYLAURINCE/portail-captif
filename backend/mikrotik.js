@@ -329,8 +329,16 @@ async function creerUtilisateurHotspot(code, profilNom, duree, mac, quota) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
         // Convertir la durée en format Mikrotik (ex: "1 heure" → "01:00:00")
+        // DOIT rester aligné sur dureeEnMs() de server.js — toute durée de
+        // forfait sans entrée ici retombe sur le fallback 1h (bug « 43min /
+        // 10 minutes » historique).
         const dureeMap = {
+            "5 minutes":  "00:05:00",
+            "10 minutes": "00:10:00",
+            "15 minutes": "00:15:00",
+            "20 minutes": "00:20:00",
             "30 minutes": "00:30:00",
+            "45 minutes": "00:45:00",
             "1 heure":    "01:00:00",
             "2 heures":   "02:00:00",
             "3 heures":   "03:00:00",
@@ -456,6 +464,27 @@ async function deconnecterClient(ip) {
 }
 
 /**
+ * Déconnecter la(s) session(s) active(s) d'un utilisateur hotspot par son
+ * nom (code ticket) — fiable quelle que soit l'IP du client (contrairement
+ * à deconnecterClient qui dépend de l'adresse, absente/invalide derrière
+ * un proxy).
+ */
+async function deconnecterSessionParUtilisateur(code) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", deconnectees: 0 };
+    try {
+        const actifs = await mikrotikCommand(["/ip/hotspot/active/print", `?user=${code}`]);
+        let deconnectees = 0;
+        for (const a of (actifs.data || [])) {
+            await mikrotikCommand(["/ip/hotspot/active/remove", `=.id=${a[".id"]}`]);
+            deconnectees++;
+        }
+        return { success: true, message: `${deconnectees} session(s) déconnectée(s) pour "${code}"`, deconnectees };
+    } catch (err) {
+        return { success: false, message: `Erreur Mikrotik: ${err.message}`, deconnectees: 0 };
+    }
+}
+
+/**
  * Lister les clients actifs sur Mikrotik
  */
 async function listerClientsActifs() {
@@ -472,17 +501,35 @@ async function listerClientsActifs() {
  * Lister les utilisateurs hotspot avec leurs compteurs CUMULÉS
  * (bytes-in + bytes-out depuis la création du user, contrairement aux
  * compteurs de session de /ip/hotspot/active qui repartent à zéro).
+ * uptime = temps de connexion cumulé ; limit-uptime = plafond du forfait.
  */
 async function listerUtilisateursHotspot() {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé", data: [] };
     try {
         const result = await mikrotikCommand([
             "/ip/hotspot/user/print",
-            "=.proplist=name,bytes-in,bytes-out,limit-bytes-total",
+            "=.proplist=name,bytes-in,bytes-out,limit-bytes-total,uptime,limit-uptime",
         ]);
         return { success: true, data: result.data || [] };
     } catch (err) {
         return { success: false, message: err.message, data: [] };
+    }
+}
+
+/**
+ * Modifier le limit-uptime d'un utilisateur hotspot existant (réparation).
+ */
+async function modifierLimitUptimeUtilisateur(code, limitMk) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        const existing = await mikrotikCommand(["/ip/hotspot/user/print", `?name=${code}`]);
+        if (!existing.data || existing.data.length === 0) {
+            return { success: false, message: `Utilisateur "${code}" introuvable` };
+        }
+        await mikrotikCommand(["/ip/hotspot/user/set", `=.id=${existing.data[0][".id"]}`, `=limit-uptime=${limitMk}`]);
+        return { success: true, message: `limit-uptime de "${code}" défini à ${limitMk}` };
+    } catch (err) {
+        return { success: false, message: `Erreur Mikrotik: ${err.message}` };
     }
 }
 
@@ -1018,6 +1065,8 @@ module.exports = {
     macDepuisIp,
     retirerSessionActiveParId,
     deconnecterClient,
+    deconnecterSessionParUtilisateur,
+    modifierLimitUptimeUtilisateur,
     informationsUtilisateurHotspot,
     listerClientsActifs,
     listerUtilisateursHotspot,
