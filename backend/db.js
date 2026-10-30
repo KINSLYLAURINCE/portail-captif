@@ -260,6 +260,19 @@ async function initSchema() {
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id)`);
     await pool.query(`ALTER TABLE retraits_fapshi ADD COLUMN IF NOT EXISTS cle_idempotence VARCHAR(100)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_retraits_fapshi_cle ON retraits_fapshi(cle_idempotence)`);
+    // Nettoyage des doublons historiques : une seule session ouverte par IP.
+    // On referme les lignes plus anciennes en gardant la plus récente.
+    await pool.query(`
+        UPDATE clients c SET statut = 'deconnecte'
+        WHERE c.statut = 'connecte'
+          AND c.ip IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM clients c2
+              WHERE c2.ip = c.ip
+                AND c2.statut = 'connecte'
+                AND (c2.debut > c.debut OR (c2.debut = c.debut AND c2.id > c.id))
+          )
+    `);
 }
 
 async function initDb() {

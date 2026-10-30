@@ -748,10 +748,16 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac, clientIp }
     // Marquer le ticket comme utilisé
     await pool.query("UPDATE tickets SET statut = 'utilise' WHERE id = $1", [ticket.id]);
 
-    // Enregistrer le client connecté
+    // Enregistrer le client connecté. Une seule ligne ouverte par IP : on
+    // referme d'abord les sessions précédentes (sinon chaque reconnexion
+    // ajoute une ligne 'connecte' et la page Clients affiche des doublons).
     try {
         await pool.query(
-            "INSERT INTO clients (ip, forfait, debut, statut) VALUES ($1, $2, now(), 'connecte') ON CONFLICT DO NOTHING",
+            "UPDATE clients SET statut = 'deconnecte' WHERE ip = $1 AND statut = 'connecte'",
+            [ipEnregistree]
+        );
+        await pool.query(
+            "INSERT INTO clients (ip, forfait, debut, statut) VALUES ($1, $2, now(), 'connecte')",
             [ipEnregistree, forfait.nom]
         );
     } catch {}
@@ -878,7 +884,7 @@ app.get("/api/admin/dashboard", adminAuth, async (req, res) => {
             (SELECT COUNT(*)::int FROM tickets WHERE statut = 'disponible')               AS tickets_dispos,
             (SELECT COUNT(*)::int FROM hotspots)                                          AS total_hotspots,
             (SELECT COUNT(*)::int FROM hotspots WHERE statut = 'actif')                   AS hotspots_actifs,
-            (SELECT COUNT(*)::int FROM clients WHERE statut = 'connecte')                 AS clients_connectes,
+            (SELECT COUNT(DISTINCT ip)::int FROM clients WHERE statut = 'connecte')       AS clients_connectes,
             (SELECT COUNT(*)::int FROM domiciles)                                         AS total_domiciles,
             (SELECT COUNT(*)::int FROM domiciles WHERE statut = 'actif')                  AS domiciles_actifs,
             (SELECT COUNT(*)::int FROM connexions)                                        AS total_connexions,
@@ -1196,7 +1202,12 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
                 // de la session en cours qui repart à zéro à chaque reconnexion.
                 tempsCumules.set(u.name, uptimeToSecondes(u.uptime));
             }
+            const vusLive = new Set();
             for (const c of (actifs.data || [])) {
+                // Une seule entrée par IP : RouterOS peut garder plusieurs
+                // sessions actives pour le même client (reconnexions).
+                if (c.address && vusLive.has(c.address)) continue;
+                if (c.address) vusLive.add(c.address);
                 const total = cumuls.has(c.user)
                     ? cumuls.get(c.user)
                     : (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
@@ -1221,10 +1232,14 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
     } catch (e) {
         console.error("Mikrotik clients merge error:", e.message);
     }
-    const { rows } = await pool.query("SELECT * FROM clients WHERE statut = 'connecte'");
+    // La plus récente d'abord : on ne garde qu'une ligne ouverte par IP.
+    const { rows } = await pool.query("SELECT * FROM clients WHERE statut = 'connecte' ORDER BY debut DESC, id DESC");
     const dbMapped = mapRows(rows);
     const liveIps = new Set(resultats.map(x => x.ip));
+    const vusDb = new Set();
     for (const d of dbMapped) {
+        if (vusDb.has(d.ip)) continue;
+        vusDb.add(d.ip);
         d.source = "db";
         if (liveIps.has(d.ip)) {
             const live = resultats.find(x => x.ip === d.ip);
