@@ -1056,6 +1056,7 @@ async function basculerHotspot(nom, actif) {
 
 module.exports = {
     MIKROTIK_ENABLED,
+    mikrotikCommand,
     testerConnexion,
     creerProfilHotspot,
     supprimerProfilHotspot,

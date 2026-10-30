@@ -147,3 +147,47 @@ CREATE TABLE IF NOT EXISTS appareils_gratuits (
     UNIQUE (appareil_id, forfait_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id);
+
+-- ─── FINANCES KADJI — TRANSFERTS VERS LE SERVICE DE RETRAIT ─────────
+CREATE TABLE IF NOT EXISTS transferts_fapshi (
+    id              SERIAL PRIMARY KEY,
+    montant         INTEGER NOT NULL CHECK (montant > 0),
+    reference       VARCHAR(100),
+    note            TEXT,
+    admin           VARCHAR(100),
+    date_transfert  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_transferts_fapshi_date ON transferts_fapshi(date_transfert);
+
+-- ─── FINANCES KADJI — RETRAITS FAPSHI ───────────────────────────────
+CREATE TABLE IF NOT EXISTS retraits_fapshi (
+    id                SERIAL PRIMARY KEY,
+    montant           INTEGER NOT NULL CHECK (montant BETWEEN 100 AND 500000),
+    telephone         VARCHAR(30),
+    operateur         VARCHAR(30),
+    nom_beneficiaire  VARCHAR(100),
+    email             VARCHAR(150),
+    user_id           VARCHAR(100) NOT NULL UNIQUE,
+    external_id       VARCHAR(100) NOT NULL UNIQUE,
+    cle_idempotence   VARCHAR(100) UNIQUE,
+    trans_id          VARCHAR(100),
+    statut            VARCHAR(20) NOT NULL DEFAULT 'EN_ATTENTE',
+    message           TEXT,
+    admin             VARCHAR(100),
+    ip                VARCHAR(60),
+    date_creation     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    date_maj          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_retraits_fapshi_statut ON retraits_fapshi(statut);
+CREATE INDEX IF NOT EXISTS idx_retraits_fapshi_date ON retraits_fapshi(date_creation);
+
+-- ─── FINANCES KADJI — JOURNAL D'AUDIT ───────────────────────────────
+CREATE TABLE IF NOT EXISTS journal_finance (
+    id        SERIAL PRIMARY KEY,
+    action    VARCHAR(50) NOT NULL,
+    details   JSONB,
+    admin     VARCHAR(100),
+    ip        VARCHAR(60),
+    date      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_journal_finance_date ON journal_finance(date);

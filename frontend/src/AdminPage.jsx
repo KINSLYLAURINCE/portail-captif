@@ -1236,6 +1236,351 @@ function Finances({ token }) {
   );
 }
 
+function FinancesKadji({ token }) {
+  const [data, setData] = useState(null);
+  const [retraits, setRetraits] = useState([]);
+  const [transferts, setTransferts] = useState([]);
+  const [filtres, setFiltres] = useState({ from: "", to: "" });
+  const [transfert, setTransfert] = useState({ montant: "", reference: "", note: "", date_transfert: "" });
+  const [retrait, setRetrait] = useState({ montant: "", telephone: "", operateur: "MTN", nom_beneficiaire: "", email: "" });
+  const [msg, setMsg] = useState({ text: "", type: "" });
+  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const showMsg = (text, type = "success") => { setMsg({ text, type }); setTimeout(() => setMsg({ text: "", type: "" }), 4000); };
+  const headers = { Authorization: `Bearer ${token}` };
+  const fmtMontant = (v) => (Number(v) || 0).toLocaleString("fr-FR");
+  const fmtDate = (d) => d ? new Date(d).toLocaleString("fr-FR") : "—";
+
+  const badgeStatut = (s) => {
+    const map = {
+      EN_ATTENTE: ["yellow", "En attente"],
+      ACCEPTE: ["blue", "Accepté"],
+      SUCCESSFUL: ["green", "Payé"],
+      FAILED: ["red", "Échoué"],
+      A_VERIFIER: ["orange", "À vérifier"],
+      due: ["yellow", "Due"],
+      transferee: ["green", "Transférée"],
+      annulee: ["red", "Annulée"],
+    };
+    const [cls, label] = map[s] || ["dark", s || "—"];
+    return <span className={`badge ${cls}`}>{label}</span>;
+  };
+
+  const charger = async (f = filtres) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (f.from) params.set("from", f.from);
+      if (f.to) params.set("to", f.to);
+      const qs = params.toString();
+      const [fin, ret, tr] = await Promise.all([
+        axios.get(`/api/admin/kadji/finances${qs ? `?${qs}` : ""}`, { headers }),
+        axios.get("/api/admin/fapshi/retraits", { headers }),
+        axios.get("/api/admin/fapshi/transferts", { headers }),
+      ]);
+      setData(fin.data);
+      setRetraits(ret.data.retraits || []);
+      setTransferts(tr.data.transferts || []);
+    } catch (err) {
+      showMsg(err.response?.data?.message || "Erreur chargement des finances Kadji.", "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { charger(); }, []);
+
+  const enregistrerTransfert = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      await axios.post("/api/admin/fapshi/transferts", transfert, { headers });
+      showMsg("Transfert enregistré.");
+      setTransfert({ montant: "", reference: "", note: "", date_transfert: "" });
+      await charger();
+    } catch (err) {
+      showMsg(err.response?.data?.message || "Erreur enregistrement du transfert.", "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const demanderRetrait = async (e) => {
+    e.preventDefault();
+    const m = Number(retrait.montant || 0);
+    if (!window.confirm(`Confirmer le retrait de ${fmtMontant(m)} FCFA vers ${retrait.telephone} (${retrait.operateur}) ?`)) return;
+    setSubmitting(true);
+    try {
+      const cle = (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const r = await axios.post("/api/admin/fapshi/retraits", retrait, {
+        headers: { ...headers, "Idempotency-Key": cle },
+      });
+      showMsg(r.data.message || "Retrait envoyé.");
+      setRetrait({ montant: "", telephone: "", operateur: "MTN", nom_beneficiaire: "", email: "" });
+      await charger();
+    } catch (err) {
+      showMsg(err.response?.data?.message || "Erreur lors du retrait.", "error");
+      await charger();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const verifierRetrait = async (id) => {
+    try {
+      const r = await axios.post(`/api/admin/fapshi/retraits/${id}/verifier`, {}, { headers });
+      showMsg(`Retrait #${id} : ${r.data.statut}`);
+      await charger();
+    } catch (err) {
+      showMsg(err.response?.data?.message || "Erreur vérification du retrait.", "error");
+    }
+  };
+
+  if (!data) return <div className="loading">Chargement...</div>;
+  const t = data.totaux || {};
+  const commissions = data.commissions || [];
+
+  return (
+    <div className="tab-content">
+      <h2 className="section-title">
+        <><DollarSign size={20} /> Finances Kadji WiFi</>
+        <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "normal", marginLeft: "12px" }}>
+          <><RefreshCw size={12} /> {loading ? "Actualisation..." : new Date().toLocaleTimeString("fr-FR")}</>
+        </span>
+      </h2>
+
+      {msg.text && <div className={`feedback ${msg.type}`}>{msg.text}</div>}
+
+      <div className="stats-grid">
+        <div className="stat-card green">
+          <div className="stat-icon"><DollarSign size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.encaisse)} F</div>
+            <div className="stat-label">Encaissé Kadji (brut)</div>
+          </div>
+        </div>
+        <div className="stat-card dark">
+          <div className="stat-icon"><CreditCard size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.fraisFapshi)} F</div>
+            <div className="stat-label">Frais Fapshi (3 %)</div>
+          </div>
+        </div>
+        <div className="stat-card blue">
+          <div className="stat-icon"><BarChart3 size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.net)} F</div>
+            <div className="stat-label">Net après frais</div>
+          </div>
+        </div>
+        <div className="stat-card yellow">
+          <div className="stat-icon"><AlertTriangle size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.commissionDue)} F</div>
+            <div className="stat-label">Commission 7 % due</div>
+          </div>
+        </div>
+        <div className="stat-card purple">
+          <div className="stat-icon"><ArrowRight size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.totalTransfere)} F</div>
+            <div className="stat-label">Transféré au service de retrait</div>
+          </div>
+        </div>
+        <div className="stat-card teal">
+          <div className="stat-icon"><Check size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.totalRetire)} F</div>
+            <div className="stat-label">Retiré</div>
+          </div>
+        </div>
+        <div className="stat-card orange">
+          <div className="stat-icon"><Clock size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{t.soldePayout != null ? `${fmtMontant(t.soldePayout)} F` : "—"}</div>
+            <div className="stat-label">Solde payout Fapshi</div>
+          </div>
+        </div>
+        <div className="stat-card red">
+          <div className="stat-icon"><RefreshCw size={24} /></div>
+          <div className="stat-info">
+            <div className="stat-value">{fmtMontant(t.retraitsEnCours)} F</div>
+            <div className="stat-label">Retraits en cours</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="admin-section">
+        <div className="section-header">
+          <h3><><Search size={16} /> Filtres</></h3>
+          <button className="btn-export" onClick={() => { setFiltres({ from: "", to: "" }); charger({ from: "", to: "" }); }}>
+            <><X size={14} /> Réinitialiser</>
+          </button>
+        </div>
+        <form onSubmit={(e) => { e.preventDefault(); charger(filtres); }} style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div className="form-group">
+            <label>Du</label>
+            <input type="date" value={filtres.from} onChange={e => setFiltres({ ...filtres, from: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Au</label>
+            <input type="date" value={filtres.to} onChange={e => setFiltres({ ...filtres, to: e.target.value })} />
+          </div>
+          <div className="form-group form-btn">
+            <button type="submit" disabled={loading}>{loading ? "..." : <><Search size={14} /> Filtrer</>}</button>
+          </div>
+          <div className="form-group form-btn">
+            <button type="button" className="btn-export" onClick={() => charger()} disabled={loading}>
+              <><RefreshCw size={14} /> Actualiser</>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div className="admin-section">
+        <h3><><ArrowRight size={16} /> Transférer la commission vers le service de retrait</></h3>
+        <p style={{ fontSize: "13px", color: "#64748b", marginBottom: "12px" }}>
+          Fapshi ne permet pas le transfert via API. Dans le dashboard Fapshi, transférez la commission du service de collecte vers le service de retrait (instantané et gratuit), puis enregistrez le transfert ici.
+        </p>
+        <form onSubmit={enregistrerTransfert} style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div className="form-group">
+            <label>Montant (FCFA)</label>
+            <input type="number" min="1" value={transfert.montant} onChange={e => setTransfert({ ...transfert, montant: e.target.value })} required />
+          </div>
+          <div className="form-group">
+            <label>Référence Fapshi</label>
+            <input type="text" value={transfert.reference} onChange={e => setTransfert({ ...transfert, reference: e.target.value })} placeholder="ID du transfert" />
+          </div>
+          <div className="form-group">
+            <label>Date</label>
+            <input type="datetime-local" value={transfert.date_transfert} onChange={e => setTransfert({ ...transfert, date_transfert: e.target.value })} />
+          </div>
+          <div className="form-group" style={{ flex: "1 1 220px" }}>
+            <label>Note</label>
+            <input type="text" value={transfert.note} onChange={e => setTransfert({ ...transfert, note: e.target.value })} placeholder="Optionnel" />
+          </div>
+          <div className="form-group form-btn">
+            <button type="submit" disabled={submitting}><><Check size={14} /> Enregistrer</></button>
+          </div>
+        </form>
+      </div>
+
+      <div className="admin-section">
+        <h3><><CreditCard size={16} /> Retrait vers Mobile Money</></h3>
+        <p style={{ fontSize: "13px", color: "#64748b", marginBottom: "12px" }}>
+          Minimum 100 FCFA, maximum 500 000 FCFA par retrait. Le nom du titulaire est saisi manuellement (Fapshi ne fournit pas de vérification de nom).
+        </p>
+        <form onSubmit={demanderRetrait} style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div className="form-group">
+            <label>Montant (FCFA)</label>
+            <input type="number" min="100" max="500000" value={retrait.montant} onChange={e => setRetrait({ ...retrait, montant: e.target.value })} required />
+          </div>
+          <div className="form-group">
+            <label>Téléphone</label>
+            <input type="tel" value={retrait.telephone} onChange={e => setRetrait({ ...retrait, telephone: e.target.value })} placeholder="6XXXXXXXX" required />
+          </div>
+          <div className="form-group">
+            <label>Opérateur</label>
+            <select value={retrait.operateur} onChange={e => setRetrait({ ...retrait, operateur: e.target.value })}>
+              <option value="MTN">MTN MoMo</option>
+              <option value="ORANGE">Orange Money</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Nom du titulaire</label>
+            <input type="text" value={retrait.nom_beneficiaire} onChange={e => setRetrait({ ...retrait, nom_beneficiaire: e.target.value })} placeholder="Nom complet" />
+          </div>
+          <div className="form-group">
+            <label>Email (optionnel)</label>
+            <input type="email" value={retrait.email} onChange={e => setRetrait({ ...retrait, email: e.target.value })} />
+          </div>
+          <div className="form-group form-btn">
+            <button type="submit" disabled={submitting || (t.soldePayout != null && Number(retrait.montant) > Number(t.soldePayout))}>
+              <><ArrowRight size={14} /> Retirer</>
+            </button>
+          </div>
+        </form>
+        {t.soldePayoutErreur && <p className="empty-msg">Solde indisponible : {t.soldePayoutErreur}</p>}
+      </div>
+
+      <div className="admin-section">
+        <h3><><Clock size={16} /> Historique des retraits ({retraits.length})</></h3>
+        {retraits.length === 0 ? <p className="empty-msg">Aucun retrait.</p> : (
+          <div className="table-wrapper"><table>
+            <thead>
+              <tr><th>#</th><th>Date</th><th>Montant</th><th>Téléphone</th><th>Opérateur</th><th>Titulaire</th><th>Statut</th><th>TransId</th><th>Action</th></tr>
+            </thead>
+            <tbody>
+              {retraits.map(r => (
+                <tr key={r.id}>
+                  <td>{r.id}</td>
+                  <td style={{ fontSize: "12px", whiteSpace: "nowrap" }}>{fmtDate(r.dateCreation)}</td>
+                  <td><span className="badge green">{fmtMontant(r.montant)} F</span></td>
+                  <td>{r.telephone || "—"}</td>
+                  <td><span className="badge blue">{r.operateur || "—"}</span></td>
+                  <td>{r.nomBeneficiaire || "—"}</td>
+                  <td>{badgeStatut(r.statut)}</td>
+                  <td style={{ fontSize: "11px", fontFamily: "monospace", color: "#64748b" }}>{r.transId || "—"}</td>
+                  <td>
+                    <button className="btn-export" onClick={() => verifierRetrait(r.id)}>
+                      <><RefreshCw size={12} /> Vérifier</>
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table></div>
+        )}
+      </div>
+
+      <div className="admin-section">
+        <h3><><ArrowRight size={16} /> Transferts enregistrés ({transferts.length})</></h3>
+        {transferts.length === 0 ? <p className="empty-msg">Aucun transfert enregistré.</p> : (
+          <div className="table-wrapper"><table>
+            <thead><tr><th>Date</th><th>Montant</th><th>Référence</th><th>Note</th><th>Admin</th></tr></thead>
+            <tbody>
+              {transferts.map(tr => (
+                <tr key={tr.id}>
+                  <td style={{ fontSize: "12px", whiteSpace: "nowrap" }}>{fmtDate(tr.dateTransfert)}</td>
+                  <td><span className="badge green">{fmtMontant(tr.montant)} F</span></td>
+                  <td>{tr.reference || "—"}</td>
+                  <td>{tr.note || "—"}</td>
+                  <td>{tr.admin || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table></div>
+        )}
+      </div>
+
+      <div className="admin-section">
+        <h3><><List size={16} /> Paiements Kadji et commission 7 % ({commissions.length})</></h3>
+        {commissions.length === 0 ? <p className="empty-msg">Aucun paiement Kadji.</p> : (
+          <div className="table-wrapper"><table>
+            <thead>
+              <tr><th>Date</th><th>Ticket</th><th>Forfait</th><th>Montant payé</th><th>Commission 7 %</th><th>Statut</th><th>Référence</th></tr>
+            </thead>
+            <tbody>
+              {commissions.map(c => (
+                <tr key={c.id}>
+                  <td style={{ fontSize: "12px", whiteSpace: "nowrap" }}>{fmtDate(c.dateCreation)}</td>
+                  <td className="code-cell">{c.ticketCode || "—"}</td>
+                  <td><span className="badge blue">{c.forfaitNom || "—"}</span></td>
+                  <td><span className="badge green">{fmtMontant(c.montantPaiement)} F</span></td>
+                  <td><span className="badge yellow">{fmtMontant(c.montantCommission)} F</span></td>
+                  <td>{badgeStatut(c.statut)}</td>
+                  <td style={{ fontSize: "11px", fontFamily: "monospace", color: "#64748b" }}>{c.paiementReference || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table></div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Paramètres ────────────────────────────────────────────────────────────
 function Parametres({ token }) {
   const [params, setParams] = useState(null);
@@ -1904,6 +2249,7 @@ function AdminPage() {
     { id: "clients",            label: <><Users size={16} /> Clients</>              },
     { id: "stats",              label: <><BarChart3 size={16} /> Stats</>                },
     { id: "finances",           label: <><DollarSign size={16} /> Gestion d'Argent</>     },
+    { id: "finances-kadji",     label: <><CreditCard size={16} /> Finances Kadji</>      },
     { id: "blacklist",          label: <><ShieldBan size={16} /> Blacklist</>            },
     { id: "logs",               label: <><ScrollText size={16} /> Journaux</>             },
     { id: "parametres",         label: <><Settings size={16} /> Paramètres</>           },
@@ -1954,6 +2300,7 @@ function AdminPage() {
           {onglet === "clients"             && <Clients          token={token} />}
           {onglet === "stats"               && <Stats            token={token} />}
           {onglet === "finances"            && <Finances         token={token} />}
+          {onglet === "finances-kadji"      && <FinancesKadji    token={token} />}
           {onglet === "blacklist"           && <Blacklist        token={token} />}
           {onglet === "logs"                && <Logs             token={token} />}
           {onglet === "parametres"          && <Parametres       token={token} />}

@@ -116,6 +116,19 @@ setInterval(() => {
 
 const { pool, mapRow, mapRows, ajouterLog } = db;
 
+// Pool lecture seule vers la base Kadji (même serveur PostgreSQL, autre base)
+const { Pool } = require("pg");
+const kadjiPool = new Pool({
+    host: process.env.KADJI_PGHOST || process.env.PGHOST || "localhost",
+    port: parseInt(process.env.KADJI_PGPORT || process.env.PGPORT || "5432", 10),
+    database: process.env.KADJI_PGDATABASE || "kadji_wifi",
+    user: process.env.KADJI_PGUSER || process.env.PGUSER || "postgres",
+    password: process.env.KADJI_PGPASSWORD || process.env.PGPASSWORD || "",
+    max: 5,
+    idleTimeoutMillis: 30000,
+});
+kadjiPool.on("error", (err) => console.error("❌ [Kadji DB] Erreur pool:", err.message));
+
 function genCode() {
     const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let code = "ST-";
@@ -1611,6 +1624,376 @@ app.get("/api/admin/finances", adminAuth, async (req, res) => {
         parOperateur: parOperateurRows.rows,
         connexions: connexionsRows.rows.map(mapRow),
         filtres: { from: from || null, to: to || null, forfaitId: forfaitId || null, gratuit: gratuit || null }
+    });
+});
+
+// ─────────────────────────────────────────
+// FINANCES KADJI — COMMISSION 7 % + RETRAITS FAPSHI
+// ─────────────────────────────────────────
+
+const COMMISSION_TAUX = parseFloat(process.env.COMMISSION_TAUX || "7");
+
+function adminLabel(req) {
+    return req.admin?.email || req.admin?.nom || "admin";
+}
+
+async function journalFinance(req, action, details) {
+    try {
+        await pool.query(
+            `INSERT INTO journal_finance (action, details, admin, ip) VALUES ($1, $2::jsonb, $3, $4)`,
+            [action, JSON.stringify(details || {}), adminLabel(req), req.ip || null]
+        );
+    } catch (err) {
+        console.error("❌ [Journal Finance] Erreur:", err.message);
+    }
+}
+
+function mediumDepuisOperateur(operateur) {
+    const op = String(operateur || "").trim().toLowerCase();
+    if (op === "orange" || op === "orange money") return "orange money";
+    if (op === "mtn" || op === "mtn momo" || op === "mobile money") return "mobile money";
+    return null;
+}
+
+async function handlerFinancesKadji(req, res) {
+    const { from, to } = req.query;
+    const filters = [];
+    const params = [];
+
+    if (from) {
+        params.push(from);
+        filters.push(`c.date_creation::date >= $${params.length}::date`);
+    }
+    if (to) {
+        params.push(to);
+        filters.push(`c.date_creation::date <= $${params.length}::date`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    try {
+        const commissionsRes = await kadjiPool.query(`
+            SELECT c.*, f.nom AS forfait_nom
+            FROM commissions c
+            LEFT JOIN forfaits f ON f.id = c.forfait_id
+            ${where}
+            ORDER BY c.date_creation DESC
+            LIMIT 1000
+        `, params);
+
+        const totauxRes = await kadjiPool.query(`
+            SELECT
+                COUNT(*)::int AS paiements,
+                COALESCE(SUM(montant_paiement), 0)::int AS encaisse,
+                COALESCE(SUM(montant_commission), 0)::int AS commission_totale,
+                COUNT(*) FILTER (WHERE statut = 'annulee')::int AS commissions_annulees
+            FROM commissions c
+            ${where}
+        `, params);
+
+        const transfertsRes = await pool.query(`
+            SELECT COALESCE(SUM(montant), 0)::int AS total, COUNT(*)::int AS nombre
+            FROM transferts_fapshi
+        `);
+
+        const retraitsRes = await pool.query(`
+            SELECT
+                COALESCE(SUM(montant) FILTER (WHERE statut IN ('ACCEPTE', 'SUCCESSFUL')), 0)::int AS total,
+                COALESCE(SUM(montant) FILTER (WHERE statut IN ('EN_ATTENTE', 'A_VERIFIER')), 0)::int AS en_cours,
+                COUNT(*)::int AS nombre
+            FROM retraits_fapshi
+        `);
+
+        const solde = await fapshi.soldePayout();
+
+        const totaux = totauxRes.rows[0];
+        const encaisse = totaux.encaisse || 0;
+        const fraisFapshi = Math.round(encaisse * 0.03);
+        const net = encaisse - fraisFapshi;
+        const commissionTotale = totaux.commission_totale || 0;
+        const totalTransfere = transfertsRes.rows[0].total || 0;
+        const commissionDue = Math.max(commissionTotale - totalTransfere, 0);
+        const totalRetire = retraitsRes.rows[0].total || 0;
+        const retraitsEnCours = retraitsRes.rows[0].en_cours || 0;
+
+        res.json({
+            success: true,
+            totaux: {
+                paiements: totaux.paiements,
+                encaisse,
+                fraisFapshi,
+                net,
+                commissionTotale,
+                commissionDue,
+                totalTransfere,
+                totalRetire,
+                retraitsEnCours,
+                commissionsAnnulees: totaux.commissions_annulees,
+                soldePayout: solde.success ? solde.balance : null,
+                soldePayoutErreur: solde.success ? null : solde.message,
+                servicePayout: solde.success ? solde.service : null,
+                devise: solde.success ? solde.currency : "XAF",
+                taux: COMMISSION_TAUX,
+            },
+            commissions: commissionsRes.rows.map(mapRow),
+            filtres: { from: from || null, to: to || null },
+        });
+    } catch (err) {
+        console.error("❌ [Finances Kadji] Erreur:", err.message);
+        res.status(503).json({
+            success: false,
+            message: "Impossible de lire les données Kadji: " + err.message,
+        });
+    }
+}
+
+app.get("/api/admin/kadji/finances", adminAuth, handlerFinancesKadji);
+app.get("/api/admin/kadji/commissions", adminAuth, handlerFinancesKadji);
+app.get("/api/admin/kadji/paiements", adminAuth, handlerFinancesKadji);
+
+// Enregistrer un transfert manuel (dashboard Fapshi) vers le service de retrait
+app.post("/api/admin/fapshi/transferts", adminAuth, rateLimit(20, 60000), async (req, res) => {
+    const { montant, reference, note, date_transfert } = req.body || {};
+    const m = parseInt(montant, 10);
+
+    if (!Number.isFinite(m) || m <= 0) {
+        return res.status(400).json({ success: false, message: "Montant invalide." });
+    }
+
+    try {
+        const r = await pool.query(
+            `INSERT INTO transferts_fapshi (montant, reference, note, admin, date_transfert)
+             VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, now()))
+             RETURNING *`,
+            [m, reference || null, note || null, adminLabel(req), date_transfert || null]
+        );
+
+        await journalFinance(req, "transfert_fapshi", {
+            montant: m,
+            reference: reference || null,
+            note: note || null,
+        });
+
+        res.status(201).json({ success: true, transfert: mapRow(r.rows[0]) });
+    } catch (err) {
+        console.error("❌ [Transfert Fapshi] Erreur:", err.message);
+        res.status(500).json({ success: false, message: "Erreur enregistrement du transfert." });
+    }
+});
+
+app.get("/api/admin/fapshi/transferts", adminAuth, async (req, res) => {
+    try {
+        const r = await pool.query(
+            "SELECT * FROM transferts_fapshi ORDER BY date_transfert DESC LIMIT 500"
+        );
+        res.json({ success: true, transferts: mapRows(r.rows) });
+    } catch (err) {
+        console.error("❌ [Transferts Fapshi] Erreur:", err.message);
+        res.status(500).json({ success: false, message: "Erreur lecture des transferts." });
+    }
+});
+
+app.get("/api/admin/fapshi/solde", adminAuth, async (req, res) => {
+    const solde = await fapshi.soldePayout();
+    if (!solde.success) return res.status(502).json(solde);
+    res.json(solde);
+});
+
+// Créer un retrait (POST /payout)
+app.post("/api/admin/fapshi/retraits", adminAuth, rateLimit(10, 60000), async (req, res) => {
+    const { montant, telephone, operateur, nom_beneficiaire, email } = req.body || {};
+    const m = parseInt(montant, 10);
+
+    if (!Number.isFinite(m) || m < 100 || m > 500000) {
+        return res.status(400).json({
+            success: false,
+            message: "Le montant doit être compris entre 100 et 500 000 FCFA.",
+        });
+    }
+
+    const medium = mediumDepuisOperateur(operateur);
+    if (!medium) {
+        return res.status(400).json({ success: false, message: "Opérateur invalide (MTN ou Orange)." });
+    }
+
+    const tel = fapshi.normaliserTelephone(telephone);
+    if (!/^6\d{8}$/.test(tel)) {
+        return res.status(400).json({
+            success: false,
+            message: "Numéro invalide (9 chiffres commençant par 6).",
+        });
+    }
+
+    const cleIdempotence =
+        String(req.headers["idempotency-key"] || req.body?.cle_idempotence || "").trim() || null;
+
+    if (cleIdempotence) {
+        const exist = await pool.query(
+            "SELECT * FROM retraits_fapshi WHERE cle_idempotence = $1",
+            [cleIdempotence]
+        );
+        if (exist.rows.length > 0) {
+            return res.json({
+                success: true,
+                idempotent: true,
+                retrait: mapRow(exist.rows[0]),
+                message: "Retrait déjà enregistré (clé d'idempotence).",
+            });
+        }
+    }
+
+    const solde = await fapshi.soldePayout();
+    if (!solde.success) {
+        return res.status(502).json({
+            success: false,
+            message: "Solde Fapshi indisponible: " + solde.message,
+        });
+    }
+    if (Number(solde.balance) < m) {
+        return res.status(400).json({
+            success: false,
+            message: `Solde insuffisant (${solde.balance} FCFA disponibles).`,
+        });
+    }
+
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const userId = `RET-${suffix}`;
+    const externalId = userId;
+
+    let row;
+    try {
+        const ins = await pool.query(
+            `INSERT INTO retraits_fapshi
+                (montant, telephone, operateur, nom_beneficiaire, email, user_id, external_id, cle_idempotence, statut, admin, ip)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'EN_ATTENTE', $9, $10)
+             RETURNING *`,
+            [
+                m, tel, medium, nom_beneficiaire || null, email || null,
+                userId, externalId, cleIdempotence, adminLabel(req), req.ip || null,
+            ]
+        );
+        row = mapRow(ins.rows[0]);
+    } catch (err) {
+        console.error("❌ [Retrait Fapshi] Erreur insertion:", err.message);
+        return res.status(500).json({ success: false, message: "Erreur création du retrait." });
+    }
+
+    const result = await fapshi.creerRetrait({
+        amount: m,
+        phone: tel,
+        medium,
+        name: nom_beneficiaire || undefined,
+        email: email || undefined,
+        userId,
+        externalId,
+        message: `Retrait Kadji WiFi — ${nom_beneficiaire || tel}`,
+    });
+
+    let statut = "FAILED";
+    if (result.success) statut = "ACCEPTE";
+    else if (result.incertain) statut = "A_VERIFIER";
+
+    const upd = await pool.query(
+        `UPDATE retraits_fapshi
+         SET trans_id = COALESCE($2, trans_id), statut = $3, message = $4, date_maj = now()
+         WHERE id = $1 RETURNING *`,
+        [row.id, result.transId || null, statut, result.message || null]
+    );
+
+    await journalFinance(req, "retrait_fapshi", {
+        id: row.id,
+        montant: m,
+        telephone: tel,
+        operateur: medium,
+        statut,
+        transId: result.transId || null,
+        message: result.message || null,
+    });
+
+    if (!result.success) {
+        return res.status(statut === "A_VERIFIER" ? 202 : 502).json({
+            success: false,
+            statut,
+            retrait: mapRow(upd.rows[0]),
+            message: result.message,
+        });
+    }
+
+    res.status(201).json({
+        success: true,
+        statut,
+        retrait: mapRow(upd.rows[0]),
+        message: result.message || "Retrait accepté.",
+    });
+});
+
+app.get("/api/admin/fapshi/retraits", adminAuth, async (req, res) => {
+    const { statut } = req.query;
+    const params = [];
+    let where = "";
+
+    if (statut) {
+        params.push(statut);
+        where = "WHERE statut = $1";
+    }
+
+    try {
+        const r = await pool.query(
+            `SELECT * FROM retraits_fapshi ${where} ORDER BY date_creation DESC LIMIT 500`,
+            params
+        );
+        res.json({ success: true, retraits: mapRows(r.rows) });
+    } catch (err) {
+        console.error("❌ [Retraits Fapshi] Erreur:", err.message);
+        res.status(500).json({ success: false, message: "Erreur lecture des retraits." });
+    }
+});
+
+// Réconcilier un retrait après timeout (Fapshi n'a pas d'idempotence)
+app.post("/api/admin/fapshi/retraits/:id/verifier", adminAuth, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+        return res.status(400).json({ success: false, message: "ID invalide." });
+    }
+
+    const r = await pool.query("SELECT * FROM retraits_fapshi WHERE id = $1", [id]);
+    if (r.rows.length === 0) {
+        return res.status(404).json({ success: false, message: "Retrait introuvable." });
+    }
+    const retrait = mapRow(r.rows[0]);
+
+    const result = await fapshi.transactionParUserId(retrait.userId);
+    if (!result.success) {
+        return res.status(502).json({ success: false, message: result.message });
+    }
+
+    const tx = result.transactions.find(t => t.externalId === retrait.externalId) || result.transactions[0];
+    if (!tx) {
+        return res.status(404).json({ success: false, message: "Transaction introuvable chez Fapshi." });
+    }
+
+    let statut = retrait.statut;
+    if (tx.status === "SUCCESSFUL") statut = "SUCCESSFUL";
+    else if (tx.status === "FAILED" || tx.status === "EXPIRED") statut = "FAILED";
+    else if (tx.status === "PENDING" || tx.status === "CREATED") statut = "ACCEPTE";
+
+    const upd = await pool.query(
+        `UPDATE retraits_fapshi
+         SET statut = $2, trans_id = COALESCE($3, trans_id), message = COALESCE($4, message), date_maj = now()
+         WHERE id = $1 RETURNING *`,
+        [id, statut, tx.transId || null, tx.reason || null]
+    );
+
+    await journalFinance(req, "verification_retrait", {
+        id,
+        statut,
+        transId: tx.transId || null,
+    });
+
+    res.json({
+        success: true,
+        statut,
+        transaction: tx,
+        retrait: mapRow(upd.rows[0]),
     });
 });
 
