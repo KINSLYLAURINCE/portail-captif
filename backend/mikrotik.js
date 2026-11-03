@@ -731,9 +731,34 @@ async function initierBypassFirewall() {
 }
 
 /**
- * Synchronise l'address-list smd-bypass avec les bails DHCP des MAC privilégiées.
- * Toute entrée qui ne correspond plus à un bail "bound" d'une MAC privilégiée
- * active est retirée (protection anti-réutilisation d'IP par un autre client).
+ * Vrai si `ip` appartient au réseau CIDR `cidr` (ex: "192.168.88.1/24").
+ */
+function ipDansReseau(ip, cidr) {
+    const [reseau, prefixeStr] = String(cidr || "").split("/");
+    const prefixe = parseInt(prefixeStr, 10);
+    if (!ipValide(ip) || !ipValide(reseau) || !(prefixe >= 0 && prefixe <= 32)) return false;
+    const masque = prefixe === 0 ? 0 : (0xFFFFFFFF << (32 - prefixe)) >>> 0;
+    return ((ipVersEntier(ip) & masque) >>> 0) === ((ipVersEntier(reseau) & masque) >>> 0);
+}
+
+/**
+ * Synchronise l'address-list smd-bypass avec les IP des MAC privilégiées.
+ *
+ * Sources d'identité (union — un appareil privilégié peut être dans l'un OU
+ * l'autre cas, et le bail DHCP n'est PAS la seule réalité terrain) :
+ *   1. baux DHCP "bound" (comportement historique) ;
+ *   2. baux DHCP statiques (réservation d'IP sans bail "bound" au moment du
+ *      cycle de sync) ;
+ *   3. table ARP : couvre les appareils en IP FIXE configurée sur l'appareil
+ *      (TV, PC, box…) qui ne demandent jamais de bail — sans cette source ils
+ *      restent éternellement hors de la liste et n'ont pas Internet.
+ *
+ * Seules les IP appartenant à un réseau connecté du routeur sont retenues :
+ * une IP hors plan d'adressage (ex: 192.168.0.x sans interface) ne peut pas
+ * être routée par le routeur même présente dans la liste.
+ *
+ * Toute entrée de la liste qui ne correspond plus à une MAC privilégiée active
+ * est retirée (protection anti-réutilisation d'IP par un autre client).
  * @param {string[]} macs - MACs privilégiées ACTIVES (format quelconque)
  */
 async function synchroniserAdresseBypass(macs) {
@@ -745,18 +770,49 @@ async function synchroniserAdresseBypass(macs) {
             (macs || []).map(m => normaliserMac(m)).filter(Boolean).map(m => m.toLowerCase())
         );
 
-        const leases = await mikrotikCommand(["/ip/dhcp-server/lease/print"]);
-        const voulues = new Map(); // ip -> mac
+        // Timeout élargi : ces impressions sont volumineuses (ARP + baux) et un
+        // timeout de 5 s provoquait des "Timeout connexion Mikrotik" en rafale,
+        // laissant la liste dans un état incohérent.
+        const [leases, arp, adresses] = await Promise.all([
+            mikrotikCommand(["/ip/dhcp-server/lease/print"], 15000),
+            mikrotikCommand(["/ip/arp/print"], 15000),
+            mikrotikCommand(["/ip/address/print"], 15000),
+        ]);
+
+        const reseaux = (adresses.data || [])
+            .filter(a => a.disabled !== "true" && a.disabled !== true)
+            .map(a => a.address)
+            .filter(Boolean);
+
+        const voulues = new Map(); // ip -> { mac, source }
+        const ajouter = (ip, macL, source) => {
+            if (!ip || ip === "0.0.0.0") return;
+            if (!reseaux.some(c => ipDansReseau(ip, c))) return;
+            // Une même IP ne peut appartenir qu'à un seul appareil : on garde
+            // la source la plus fiable déjà rencontrée (bail avant ARP).
+            if (!voulues.has(ip)) voulues.set(ip, { mac: macL, source });
+        };
+
+        // 1) Baux DHCP : actifs ("bound") ou réservations statiques.
         for (const l of leases.data || []) {
             const macL = normaliserMac(l["mac-address"]);
-            if (l.status === "bound" && macL && l.address && macsVoulues.has(macL.toLowerCase())) {
-                voulues.set(l.address, macL.toLowerCase());
-            }
+            if (!macL || !l.address || !macsVoulues.has(macL.toLowerCase())) continue;
+            const statique = l.static === "true" || l.static === true;
+            if (l.status === "bound" || statique) ajouter(l.address, macL.toLowerCase(), "bail");
+        }
+
+        // 2) ARP : appareils en IP fixe qui ne prennent jamais de bail.
+        for (const a of arp.data || []) {
+            const macL = normaliserMac(a["mac-address"]);
+            if (!macL || !a.address || !macsVoulues.has(macL.toLowerCase())) continue;
+            if (a.complete === "false" || a.complete === false) continue;
+            if (a.invalid === "true" || a.invalid === true) continue;
+            ajouter(a.address, macL.toLowerCase(), "arp");
         }
 
         const actuelles = await mikrotikCommand([
             "/ip/firewall/address-list/print", `?list=${BYPASS_LISTE}`,
-        ]);
+        ], 15000);
         const existantes = new Map(); // ip -> {id, comment}
         for (const e of actuelles.data || []) {
             if (e.address && e[".id"]) existantes.set(e.address, { id: e[".id"], comment: String(e.comment || "") });
@@ -764,29 +820,31 @@ async function synchroniserAdresseBypass(macs) {
 
         let ajouts = 0, retraits = 0, corrections = 0;
         for (const [ip, ent] of existantes) {
-            const macAttendue = voulues.get(ip);
-            if (!macAttendue) {
+            const voulue = voulues.get(ip);
+            if (!voulue) {
                 await mikrotikCommand(["/ip/firewall/address-list/remove", `=.id=${ent.id}`]);
                 retraits++;
-            } else if (ent.comment.toLowerCase() !== macAttendue) {
-                await mikrotikCommand(["/ip/firewall/address-list/set", `=.id=${ent.id}`, `=comment=${macAttendue}`]);
+            } else if (ent.comment.toLowerCase() !== voulue.mac) {
+                await mikrotikCommand(["/ip/firewall/address-list/set", `=.id=${ent.id}`, `=comment=${voulue.mac}`]);
                 corrections++;
             }
         }
-        for (const [ip, macL] of voulues) {
+        for (const [ip, voulue] of voulues) {
             if (!existantes.has(ip)) {
                 await mikrotikCommand([
                     "/ip/firewall/address-list/add",
-                    `=list=${BYPASS_LISTE}`, `=address=${ip}`, `=comment=${macL}`,
+                    `=list=${BYPASS_LISTE}`, `=address=${ip}`, `=comment=${voulue.mac}`,
                 ]);
                 ajouts++;
             }
         }
 
+        const viaBail = [...voulues.values()].filter(v => v.source === "bail").length;
+        const viaArp = voulues.size - viaBail;
         return {
             success: true,
-            message: `Bypass firewall: ${voulues.size} MAC privilégiée(s) avec bail — ${ajouts} ajout(s), ${retraits} retrait(s), ${corrections} correction(s)`,
-            details: { dansListe: voulues.size, ajouts, retraits, corrections },
+            message: `Bypass firewall: ${voulues.size} IP privilégiée(s) (${viaBail} bail, ${viaArp} ARP/IP fixe) — ${ajouts} ajout(s), ${retraits} retrait(s), ${corrections} correction(s)`,
+            details: { dansListe: voulues.size, viaBail, viaArp, ajouts, retraits, corrections },
         };
     } catch (err) {
         return { success: false, message: `Erreur sync bypass firewall: ${err.message}` };

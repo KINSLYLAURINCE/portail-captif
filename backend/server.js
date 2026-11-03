@@ -267,7 +267,14 @@ async function synchroniserBypassFirewall() {
         if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
         if (process.env.MIKROTIK_BYPASS_MODE !== "on") return { success: false, message: "Bypass firewall inactif (MIKROTIK_BYPASS_MODE!=on)" };
         const macs = await macrosPriviligieesActives();
-        const r = await mk.synchroniserAdresseBypass(macs);
+        let r = await mk.synchroniserAdresseBypass(macs);
+        // Un timeout transitoire de l'API RouterOS (8728) ne doit pas laisser
+        // l'address-list dans un état obsolète : une seule nouvelle tentative
+        // avant de considérer la synchronisation en échec.
+        if (r && !r.success) {
+            await new Promise(res => setTimeout(res, 2000));
+            r = await mk.synchroniserAdresseBypass(macs);
+        }
         if (r && !r.success) {
             console.warn("⚠️  Bypass firewall:", r.message);
         } else if (r && r.message !== dernierEtatBypass) {
