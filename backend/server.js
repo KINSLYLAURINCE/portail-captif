@@ -969,7 +969,7 @@ app.post("/api/admin/forfaits", adminAuth, async (req, res) => {
     await ajouterLog("forfait", `Forfait ${estGratuit ? "GRATUIT" : ""} "${f.nom}" créé (durée: ${f.duree}${f.appareilUnique ? ", 1 appareil max" : ""})`);
 
     // Synchroniser avec Mikrotik
-    const mkResult = await mk.creerProfilHotspot(f.profilMikrotik, f.debit, f.quota);
+    const mkResult = await mk.creerProfilHotspot(f.profilMikrotik, f.debit, f.quota, f.appareilUnique);
     if (mkResult.success) {
         await ajouterLog("mikrotik", mkResult.message);
     }
@@ -1007,7 +1007,10 @@ app.put("/api/admin/forfaits/:id", adminAuth, async (req, res) => {
     );
     const updated = (await pool.query("SELECT * FROM forfaits WHERE id = $1", [id])).rows[0];
     await ajouterLog("forfait", `Forfait "${mapRow(updated).nom}" modifié`);
-    return res.json({ success: true, message: `Forfait "${mapRow(updated).nom}" mis à jour.`, forfait: mapRow(updated) });
+    const updatedForfait = mapRow(updated);
+    const mkResult = await mk.creerProfilHotspot(updatedForfait.profilMikrotik || updatedForfait.nom, updatedForfait.debit, updatedForfait.quota, updatedForfait.appareilUnique);
+    if (mkResult.success) await ajouterLog("mikrotik", mkResult.message);
+    return res.json({ success: true, message: `Forfait "${updatedForfait.nom}" mis à jour.`, forfait: updatedForfait, mikrotik: mkResult });
 });
 
 app.patch("/api/admin/forfaits/:id/toggle", adminAuth, async (req, res) => {
@@ -2067,7 +2070,7 @@ app.post("/api/admin/mikrotik/sync-forfaits", adminAuth, async (req, res) => {
     const allForfaits = mapRows(rows);
     const results = [];
     for (const f of allForfaits) {
-        const r = await mk.creerProfilHotspot(f.profilMikrotik || f.nom, f.debit, f.quota);
+        const r = await mk.creerProfilHotspot(f.profilMikrotik || f.nom, f.debit, f.quota, f.appareilUnique);
         results.push({ forfait: f.nom, profil: f.profilMikrotik, ...r });
     }
     const success = results.filter(r => r.success).length;

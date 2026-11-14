@@ -200,8 +200,13 @@ async function testerConnexion() {
  * @param {string} debit - Ex: "10M" ou "10 Mbps"
  * @param {string} quota - Ex: "1G" ou "1 Go"
  */
-async function creerProfilHotspot(nom, debit, quota) {
+async function creerProfilHotspot(nom, debit, quota, appareilUnique = false) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+
+    // shared-users : 1 si le forfait est limité à un seul appareil, sinon
+    // illimité (un ticket peut alors être utilisé sur plusieurs appareils
+    // simultanément).
+    const sharedUsers = appareilUnique ? "1" : "unlimited";
 
     // Convertir le débit en format Mikrotik (ex: "10 Mbps" → "10M")
     const debitMK = debit.replace(" Mbps", "M").replace(" Kbps", "K").replace("Illimité", "0");
@@ -221,6 +226,7 @@ async function creerProfilHotspot(nom, debit, quota) {
                 "/ip/hotspot/user/profile/set",
                 `=.id=${id}`,
                 `=rate-limit=${debitMK}/${debitMK}`,
+                `=shared-users=${sharedUsers}`,
             ]);
             return { success: true, message: `Profil "${nom}" mis à jour sur Mikrotik` };
         } else {
@@ -229,7 +235,7 @@ async function creerProfilHotspot(nom, debit, quota) {
                 "/ip/hotspot/user/profile/add",
                 `=name=${nom}`,
                 `=rate-limit=${debitMK}/${debitMK}`,
-                `=shared-users=1`,
+                `=shared-users=${sharedUsers}`,
             ]);
             return { success: true, message: `Profil "${nom}" créé sur Mikrotik` };
         }
