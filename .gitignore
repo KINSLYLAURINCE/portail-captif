@@ -39,3 +39,7 @@ backend/data.json
 
 # Doc ops locale (VPS, procédures) — jamais sur git
 DEPLOIEMENT.md
+
+# Rapports Claude Council — jamais sur git
+council-report-*.html
+council-transcript-*.md
