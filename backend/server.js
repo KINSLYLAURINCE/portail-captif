@@ -708,15 +708,56 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac, clientIp }
     const reconnexion = ticket.statut === "utilise";
     if (reconnexion) {
         let restant = null;
+        // Dernière connexion du ticket : référence pour l'auto-réparation
+        // (session encore ouverte + durée forfait non écoulée = ticket valide
+        // même si l'utilisateur hotspot est absent sur Mikrotik).
+        const derniereConn = await pool.query(
+            "SELECT debut, fin FROM connexions WHERE ticket = $1 ORDER BY id DESC LIMIT 1",
+            [ticket.code]
+        );
+        const connRow = derniereConn.rows[0] || null;
         if (mk.MIKROTIK_ENABLED) {
             const info = await mk.informationsUtilisateurHotspot(ticket.code);
-            if (!info.existe || info.restant === 0) {
+            if (!info.existe) {
+                // AUTO-RÉPARATION : utilisateur hotspot absent (ex: création
+                // échouée silencieusement au premier usage lors d'un timeout
+                // Mikrotik). Si la session DB est encore ouverte et que la
+                // durée du forfait n'est pas écoulée, on recrée le user
+                // (create-if-missing — ne touche jamais un user existant, donc
+                // ne réinitialise jamais limit-uptime).
+                const fRes0 = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
+                if (fRes0.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
+                const f0 = mapRow(fRes0.rows[0]);
+                const dureeMs0 = dureeEnMs(f0.duree);
+                const debut0 = connRow?.debut ? new Date(connRow.debut).getTime() : null;
+                const expireDB = connRow?.fin || (debut0 && dureeMs0 && (Date.now() - debut0) > dureeMs0);
+                if (expireDB) {
+                    return { status: 403, body: { success: false, message: "Ce code a expiré (temps de forfait écoulé)." } };
+                }
+                const rep = await mk.creerUtilisateurHotspot(
+                    ticket.code,
+                    f0.profilMikrotik || f0.nom,
+                    f0.duree,
+                    ticket.gratuit ? macTicket : null,
+                    f0.quota
+                );
+                if (!rep.success) {
+                    await ajouterLog("mikrotik", `AUTO-RÉPARATION ${ticket.code} ÉCHOUÉE : ${rep.message}`);
+                    return { status: 503, body: { success: false, message: "Service momentanément indisponible — réessayez dans un instant." } };
+                }
+                await ajouterLog("mikrotik", `AUTO-RÉPARATION ${ticket.code} : utilisateur hotspot recréé (absent à la reconnexion)`);
+                const info2 = await mk.informationsUtilisateurHotspot(ticket.code);
+                if (!info2.existe) {
+                    return { status: 503, body: { success: false, message: "Service momentanément indisponible — réessayez dans un instant." } };
+                }
+                restant = info2.restant;
+            } else if (info.restant === 0) {
                 return { status: 403, body: { success: false, message: "Ce code a expiré (temps de forfait écoulé)." } };
-            }
-            if (info.quotaEpuise) {
+            } else if (info.quotaEpuise) {
                 return { status: 403, body: { success: false, message: "Ce code a expiré (quota de données atteint)." } };
+            } else {
+                restant = info.restant;
             }
-            restant = info.restant;
         } else {
             const fRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
             if (fRes.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
@@ -779,9 +820,19 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac, clientIp }
         try {
             const mkResult = await mk.creerUtilisateurHotspot(ticket.code, forfait.profilMikrotik || forfait.nom, forfait.duree, ticket.gratuit ? macTicket : null, forfait.quota);
             mikrotikOk = mkResult.success;
-            if (mkResult.success) await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code`);
+            if (mkResult.success) {
+                await ajouterLog("mikrotik", `Utilisateur hotspot "${ticket.code}" activé pour connexion code`);
+            } else {
+                // Échec silencieux détecté : le client paie mais l'utilisateur
+                // hotspot n'existe pas sur Mikrotik (incident ST-XT44Q9R7 du
+                // 2026-11-14). L'auto-réparation (reconnexion + sweeper) le
+                // recréera ; on trace pour le monitoring.
+                console.error(`MK user ${ticket.code} non créé : ${mkResult.message}`);
+                await ajouterLog("mikrotik", `ÉCHEC création utilisateur hotspot "${ticket.code}" (${mkResult.message}) — réparation automatique prévue`);
+            }
         } catch (e) {
             console.error("Mikrotik login-code error:", e.message);
+            await ajouterLog("mikrotik", `ÉCHEC création utilisateur hotspot "${ticket.code}" (${e.message}) — réparation automatique prévue`);
         }
     }
 
@@ -2767,6 +2818,67 @@ async function verifierExpirations() {
 
 // Vérifier les expirations toutes les 5 minutes
 setInterval(verifierExpirations, 5 * 60 * 1000);
+
+// ─── RÉCONCILIATION UTILISATEURS HOTSPOT (sweeper) ────────────────────────
+// Filet de sécurité : un ticket payant 'utilise' avec une session ouverte
+// doit toujours avoir son utilisateur hotspot sur Mikrotik. Si l'utilisateur
+// est absent (création échouée au premier usage lors d'un timeout), on le
+// recrée avec la durée du forfait (create-if-missing : ne touche jamais un
+// user existant, donc ne réinitialise jamais limit-uptime).
+async function reconcilierUtilisateursHotspot() {
+    if (!mk.MIKROTIK_ENABLED) return;
+    const { rows } = await pool.query(`
+        SELECT DISTINCT ON (t.code)
+               t.code, t.gratuit, t.mac, t.forfait_id,
+               f.profil_mikrotik, f.nom AS forfait_nom, f.duree, f.quota,
+               c.debut, c.fin
+        FROM tickets t
+        JOIN forfaits f ON f.id = t.forfait_id
+        JOIN connexions c ON c.ticket = t.code
+        WHERE t.statut = 'utilise'
+        ORDER BY t.code, c.id DESC
+    `);
+    for (const t of rows) {
+        try {
+            const info = await mk.informationsUtilisateurHotspot(t.code);
+            if (info.existe) continue;
+            // Session fermée ou durée dépassée en DB → rien à réparer
+            const dureeMs = dureeEnMs(t.duree);
+            const debut = t.debut ? new Date(t.debut).getTime() : null;
+            const expireDB = t.fin || (debut && dureeMs && (Date.now() - debut) > dureeMs);
+            if (expireDB) continue;
+            const rep = await mk.creerUtilisateurHotspot(
+                t.code,
+                t.profil_mikrotik || t.forfait_nom,
+                t.duree,
+                t.gratuit ? (normaliserMac(t.mac) || null) : null,
+                t.quota
+            );
+            if (rep.success) {
+                await ajouterLog("mikrotik", `SWEEPER ${t.code} : utilisateur hotspot recréé (absent, session ouverte)`);
+            } else {
+                await ajouterLog("mikrotik", `SWEEPER ${t.code} ÉCHOUÉ : ${rep.message}`);
+            }
+        } catch (e) {
+            console.error(`Sweeper ${t.code}:`, e.message);
+        }
+    }
+}
+
+let sweeperEnCours = false;
+async function reconcilierUtilisateursHotspotSecurise() {
+    if (sweeperEnCours) return;
+    sweeperEnCours = true;
+    try {
+        await reconcilierUtilisateursHotspot();
+    } catch (e) {
+        console.error("Erreur reconcilierUtilisateursHotspot:", e.message);
+    } finally {
+        sweeperEnCours = false;
+    }
+}
+setInterval(reconcilierUtilisateursHotspotSecurise, 5 * 60 * 1000);
+reconcilierUtilisateursHotspotSecurise().catch(() => {});
 
 // ─────────────────────────────────────────
 // (Restriction MAC supprimée) — un ticket est utilisable sur tout appareil.
