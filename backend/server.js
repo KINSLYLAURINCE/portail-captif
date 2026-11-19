@@ -771,12 +771,36 @@ async function connexionParCode({ code, deviceId, ip, userAgent, mac, clientIp }
             }
         }
         await ajouterLog("connexion", `Code ${ticket.code} réutilisé — reconnexion autorisée (reste ${Math.round(restant || 0)}s)`);
+        if (mk.MIKROTIK_ENABLED) {
+            try {
+                const kick = await mk.deconnecterSessionParUtilisateur(ticket.code);
+                if (kick.deconnectees > 0) {
+                    await ajouterLog("connexion", `Session hotspot précédente de ${ticket.code} fermée pour reconnexion (itinérance)`);
+                }
+            } catch (e) {
+                console.error(`Kick reconnexion ${ticket.code}:`, e.message);
+            }
+        }
     }
 
     // Trouver le forfait associé
     const forfaitRes = await pool.query("SELECT * FROM forfaits WHERE id = $1", [ticket.forfaitId]);
     if (forfaitRes.rows.length === 0) return { status: 404, body: { success: false, message: "Forfait introuvable." } };
     const forfait = mapRow(forfaitRes.rows[0]);
+
+    if (reconnexion) {
+        const anciennes = await pool.query(
+            "SELECT DISTINCT ip FROM connexions WHERE ticket = $1 AND fin IS NULL",
+            [ticket.code]
+        );
+        await pool.query("UPDATE connexions SET fin = now() WHERE ticket = $1 AND fin IS NULL", [ticket.code]);
+        for (const a of anciennes.rows) {
+            await pool.query(
+                "UPDATE clients SET statut = 'deconnecte' WHERE ip = $1 AND statut = 'connecte'",
+                [a.ip]
+            );
+        }
+    }
 
     // Mémoriser le premier appareil vu (indicatif uniquement pour les payants ;
     // pour les gratuits, la MAC résolue devient la référence du ticket)
@@ -2769,11 +2793,13 @@ async function verifierExpirations() {
 
         // Expirer les connexions actives dont la durée est dépassée → déconnecter sur Mikrotik
         const ouvertes = await pool.query(`
-            SELECT c.id, c.ticket, c.ip, c.debut, f.duree, f.profil_mikrotik
+            SELECT DISTINCT ON (c.ticket)
+                   c.id, c.ticket, c.ip, c.debut, f.duree, f.profil_mikrotik
             FROM connexions c
             LEFT JOIN tickets t ON t.code = c.ticket
             LEFT JOIN forfaits f ON f.id = t.forfait_id
             WHERE c.fin IS NULL AND c.debut IS NOT NULL
+            ORDER BY c.ticket, c.id DESC
         `);
         const now = Date.now();
         for (const c of ouvertes.rows) {
