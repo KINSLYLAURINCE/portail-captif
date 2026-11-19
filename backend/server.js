@@ -1247,20 +1247,25 @@ app.delete("/api/admin/hotspots", adminAuth, async (req, res) => {
 
 app.get("/api/admin/clients", adminAuth, async (req, res) => {
     const resultats = [];
+    const cumuls = new Map();
+    const tempsCumules = new Map();
+    const appliquerCumul = (client, ticket) => {
+        if (!ticket || !cumuls.has(ticket)) return false;
+        client.ticket = ticket;
+        client.quotaConsomme = octetsLisible(cumuls.get(ticket));
+        client.tempsConsomme = tempsLisible(tempsCumules.get(ticket));
+        client.tempsCumulSec = tempsCumules.get(ticket);
+        return true;
+    };
     try {
         if (mk.MIKROTIK_ENABLED) {
-            const actifs = await mk.listerClientsActifs();
-            // Cumul par utilisateur depuis la création du ticket : c'est ce
-            // compteur (et pas celui de la session) qui pilote la coupure quota.
-            const cumuls = new Map();
-            const tempsCumules = new Map();
-            const users = await mk.listerUtilisateursHotspot();
+            const [actifs, users] = await Promise.all([
+                mk.listerClientsActifs(),
+                mk.listerUtilisateursHotspot(),
+            ]);
             for (const u of (users.data || [])) {
                 if (!u.name) continue;
                 cumuls.set(u.name, (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0));
-                // u.uptime = temps de connexion CUMULÉ sur Mikrotik (reste
-                // après reconnexions) — ce que l'admin veut voir, pas l'uptime
-                // de la session en cours qui repart à zéro à chaque reconnexion.
                 tempsCumules.set(u.name, uptimeToSecondes(u.uptime));
             }
             const vusLive = new Set();
@@ -1269,25 +1274,24 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
                 // sessions actives pour le même client (reconnexions).
                 if (c.address && vusLive.has(c.address)) continue;
                 if (c.address) vusLive.add(c.address);
-                const total = cumuls.has(c.user)
-                    ? cumuls.get(c.user)
-                    : (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
-                const cumulSec = tempsCumules.has(c.user)
-                    ? tempsCumules.get(c.user)
-                    : uptimeToSecondes(c.uptime);
-                resultats.push({
+                const entry = {
                     ip: c.address,
                     mac: c["mac-address"] || null,
                     forfait: c.user || null,
                     hotspot: c.server || null,
                     debut: new Date(Date.now() - uptimeToSecondes(c.uptime) * 1000).toISOString(),
-                    quotaConsomme: octetsLisible(total),
-                    tempsConsomme: tempsLisible(cumulSec),
-                    tempsCumulSec: cumulSec,
                     debit: null,
                     statut: "connecte",
                     source: "mikrotik"
-                });
+                };
+                if (!appliquerCumul(entry, c.user)) {
+                    const total = (parseInt(c["bytes-in"]) || 0) + (parseInt(c["bytes-out"]) || 0);
+                    const cumulSec = uptimeToSecondes(c.uptime);
+                    entry.quotaConsomme = octetsLisible(total);
+                    entry.tempsConsomme = tempsLisible(cumulSec);
+                    entry.tempsCumulSec = cumulSec;
+                }
+                resultats.push(entry);
             }
         }
     } catch (e) {
@@ -1296,6 +1300,26 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
     // La plus récente d'abord : on ne garde qu'une ligne ouverte par IP.
     const { rows } = await pool.query("SELECT * FROM clients WHERE statut = 'connecte' ORDER BY debut DESC, id DESC");
     const dbMapped = mapRows(rows);
+    const { rows: connexionsRows } = await pool.query(
+        "SELECT ip, ticket, debut FROM connexions WHERE ticket IS NOT NULL ORDER BY debut DESC"
+    );
+    const ticketsParIp = new Map();
+    for (const c of connexionsRows) {
+        if (!ticketsParIp.has(c.ip)) ticketsParIp.set(c.ip, []);
+        ticketsParIp.get(c.ip).push({ ticket: c.ticket, debut: new Date(c.debut).getTime() });
+    }
+    const ticketPourClient = (client) => {
+        const liste = ticketsParIp.get(client.ip);
+        if (!liste || liste.length === 0) return null;
+        if (!client.debut) return liste[0].ticket;
+        const t = new Date(client.debut).getTime();
+        let meilleur = liste[0], ecart = Math.abs(meilleur.debut - t);
+        for (const item of liste) {
+            const e = Math.abs(item.debut - t);
+            if (e < ecart) { meilleur = item; ecart = e; }
+        }
+        return meilleur.ticket;
+    };
     const liveIps = new Set(resultats.map(x => x.ip));
     const vusDb = new Set();
     for (const d of dbMapped) {
@@ -1306,10 +1330,11 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
             const live = resultats.find(x => x.ip === d.ip);
             live.forfait = d.forfait || live.forfait;
         } else {
+            appliquerCumul(d, ticketPourClient(d));
             resultats.push(d);
         }
     }
-    const codes = resultats.map(x => (x.source === "mikrotik" ? x.forfait : null)).filter(Boolean);
+    const codes = resultats.map(x => x.ticket || (x.source === "mikrotik" ? x.forfait : null)).filter(Boolean);
     if (codes.length > 0) {
         const t = await pool.query(
             "SELECT t.code, f.nom, f.debit, f.quota, f.duree FROM tickets t JOIN forfaits f ON f.id = t.forfait_id WHERE t.code = ANY($1)",
@@ -1317,13 +1342,14 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
         );
         const map = Object.fromEntries(t.rows.map(r => [r.code, { nom: r.nom, debit: r.debit, quota: r.quota, duree: r.duree }]));
         for (const x of resultats) {
-            if (x.source !== "mikrotik") continue;
-            const info = map[x.forfait];
-            if (info) {
-                x.forfait = info.nom;
-                x.debit = info.debit;
-                x.duree = info.duree;
-                if (x.quotaConsomme && info.quota) x.quotaConsomme = `${x.quotaConsomme} / ${info.quota}`;
+            const code = x.ticket || (x.source === "mikrotik" ? x.forfait : null);
+            const info = map[code];
+            if (!info) continue;
+            if (!x.forfait) x.forfait = info.nom;
+            x.debit = info.debit;
+            x.duree = info.duree;
+            if (x.quotaConsomme && info.quota && !String(x.quotaConsomme).includes("/")) {
+                x.quotaConsomme = `${x.quotaConsomme} / ${info.quota}`;
             }
         }
     }
