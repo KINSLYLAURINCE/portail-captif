@@ -84,6 +84,67 @@ function recupererDernierTicket() {
   } catch { return null; }
 }
 
+const DELAI_RECONNEXION_AUTO = 60 * 1000;
+const DELAI_COMPTE_A_REBOURS_AUTO = 5;
+
+function afficherMessageReconnexionAuto(message, estErreur = false) {
+  let element = document.getElementById("smd-reconnexion-auto-message");
+  if (!element) {
+    element = document.createElement("div");
+    element.id = "smd-reconnexion-auto-message";
+    element.style.cssText = "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:9999;max-width:min(92vw,520px);padding:12px 18px;border-radius:999px;background:#111827;color:#fff;font:600 14px/1.4 system-ui,sans-serif;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.25)";
+    document.body.appendChild(element);
+  }
+  element.setAttribute("role", estErreur ? "alert" : "status");
+  element.style.background = estErreur ? "#b91c1c" : "#111827";
+  element.textContent = message;
+  return element;
+}
+
+function redirectionAutoAvecCompteARebours(code) {
+  let restant = DELAI_COMPTE_A_REBOURS_AUTO;
+  const element = afficherMessageReconnexionAuto(`Reconnexion automatique dans ${restant} s…`);
+  const timer = window.setInterval(() => {
+    restant -= 1;
+    if (restant <= 0) {
+      window.clearInterval(timer);
+      connexionPortailCaptif(code);
+      return;
+    }
+    element.textContent = `Reconnexion automatique dans ${restant} s…`;
+  }, 1000);
+}
+
+async function tenterReconnexionAuto() {
+  try {
+    const redirection = new URLSearchParams(window.location.search);
+    if (!redirection.get("mac") && !redirection.get("ip")) return;
+
+    const code = recupererDernierTicket()?.ticket?.code;
+    if (!code) return;
+
+    const maintenant = Date.now();
+    const precedente = Number(sessionStorage.getItem("smd_auto_reconnect") || 0);
+    if (maintenant - precedente < DELAI_RECONNEXION_AUTO) return;
+    sessionStorage.setItem("smd_auto_reconnect", String(maintenant));
+
+    const identifiants = { deviceId: getDeviceId(), mac: getMac(), clientIp: getClientIp() };
+    const etat = await axios.get(`/api/ticket-etat/${encodeURIComponent(code)}`, { params: identifiants });
+    if (etat.data?.success === false || !etat.data?.valide || etat.data?.memeAppareil === false) return;
+    if (etat.data?.actif === true) return;
+
+    const connexion = await axios.post("/api/login-code", { code, ...identifiants });
+    if (!connexion.data?.success) {
+      throw new Error(connexion.data?.message || "Connexion refusée par le serveur.");
+    }
+
+    redirectionAutoAvecCompteARebours(code);
+  } catch (erreur) {
+    console.error("Reconnexion automatique impossible :", erreur);
+    afficherMessageReconnexionAuto("Reconnexion automatique impossible. Utilisez le bouton manuel.", true);
+  }
+}
+
 // ─── Formatage du temps restant (ex: 95 → "1h 35min") ─────────────────────
 function fmtTemps(sec) {
   if (sec === null || sec === undefined) return "Illimité";
@@ -1377,6 +1438,7 @@ function App() {
     getMac();
     getClientIp();
     getGateway();
+    tenterReconnexionAuto();
   }, []);
 
   const [lang, setLangState] = useState(() => {
