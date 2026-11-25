@@ -255,6 +255,7 @@ async function initSchema() {
     await pool.query(SCHEMA_SQL);
     // Migrations pour colonnes ajoutées après la création initiale
     await pool.query(`ALTER TABLE parametres ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+    await pool.query(`ALTER TABLE parametres ADD COLUMN IF NOT EXISTS durcissement_desactive BOOLEAN NOT NULL DEFAULT false`);
     await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS mac VARCHAR(20)`);
     await pool.query(`ALTER TABLE appareils_gratuits ADD COLUMN IF NOT EXISTS mac VARCHAR(20)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_appareils_gratuits_mac ON appareils_gratuits(mac, forfait_id)`);

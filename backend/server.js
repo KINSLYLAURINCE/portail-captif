@@ -260,12 +260,98 @@ async function macrosPriviligieesActives() {
     return rows.map(r => r.mac);
 }
 
+async function profilsAppareilUniqueMikrotik() {
+    const { rows } = await pool.query(
+        "SELECT profil_mikrotik, nom FROM forfaits WHERE appareil_unique = true"
+    );
+    return rows.map(r => r.profil_mikrotik || r.nom).filter(Boolean);
+}
+
+async function lireDurcissementDesactive() {
+    const { rows } = await pool.query(
+        "SELECT durcissement_desactive FROM parametres WHERE id = 1"
+    );
+    return Boolean(rows[0]?.durcissement_desactive);
+}
+
+async function ecrireDurcissementDesactive(desactive) {
+    await pool.query(
+        "UPDATE parametres SET durcissement_desactive = $1 WHERE id = 1",
+        [Boolean(desactive)]
+    );
+}
+
+async function verifierPreflightRepeteur() {
+    if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    if (process.env.MIKROTIK_BYPASS_MODE !== "on") {
+        return { success: false, message: "Preflight ignoré : MIKROTIK_BYPASS_MODE doit être 'on'" };
+    }
+    // Le conseil 2026-11-24 exige un chokepoint anti-usurpation prouvé avant
+    // tout retrait de login-by=mac. Sans ARP statique vérifié, on ne durcit pas.
+    if (process.env.MIKROTIK_BYPASS_ANTISPOOF !== "on") {
+        return { success: false, message: "Preflight ignoré : MIKROTIK_BYPASS_ANTISPOOF doit être 'on' (ARP statique exigé)" };
+    }
+    const macs = await macrosPriviligieesActives();
+    return mk.verifierPreflightRepeteur(macs);
+}
+
+async function durcirAuthentificationHotspot() {
+    if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    // Ne jamais retirer login-by=mac tant que le contournement firewall des
+    // comptes privilégiés n'est pas actif et vérifié : sinon ils perdent l'accès.
+    if (process.env.MIKROTIK_BYPASS_MODE !== "on") {
+        return { success: false, message: "Durcissement ignoré : MIKROTIK_BYPASS_MODE doit être 'on'" };
+    }
+    if (await lireDurcissementDesactive()) {
+        return {
+            success: false,
+            code: "DURCISSEMENT_DESACTIVE",
+            message: "Durcissement désactivé durablement (rollback actif) — réactiver explicitement via /api/admin/mikrotik/reactiver-durcissement",
+        };
+    }
+    const preflight = await verifierPreflightRepeteur();
+    if (!preflight?.success) {
+        return {
+            success: false,
+            message: `Durcissement bloqué par le preflight : ${preflight?.message || "contrôle indisponible"}`,
+            details: preflight?.details,
+        };
+    }
+    try {
+        const profils = await profilsAppareilUniqueMikrotik();
+        const r = await mk.durcirAuthentificationHotspot(profils);
+        if (r?.message) console.log("🔒 " + r.message);
+        return r;
+    } catch (err) {
+        return { success: false, message: err.message };
+    }
+}
+
 let dernierEtatBypass = "";
+let durcissementFait = false;
+let purgeFaite = false;
+let nettoyageRollbackFait = false;
 
 async function synchroniserBypassFirewall() {
     try {
         if (!mk.MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
         if (process.env.MIKROTIK_BYPASS_MODE !== "on") return { success: false, message: "Bypass firewall inactif (MIKROTIK_BYPASS_MODE!=on)" };
+        if (await lireDurcissementDesactive()) {
+            let retrait = null;
+            if (!nettoyageRollbackFait) {
+                retrait = await mk.retirerBypassFirewall();
+                nettoyageRollbackFait = retrait?.success !== false;
+                if (retrait?.message) console.log("↩️  " + retrait.message);
+            }
+            return {
+                success: false,
+                code: "DURCISSEMENT_DESACTIVE",
+                message: nettoyageRollbackFait
+                    ? "Rollback durable actif : bypass firewall retiré"
+                    : "Rollback durable actif : retrait firewall incomplet (nouvelle tentative au prochain cycle)",
+                retrait,
+            };
+        }
         const macs = await macrosPriviligieesActives();
         let r = await mk.synchroniserAdresseBypass(macs);
         // Un timeout transitoire de l'API RouterOS (8728) ne doit pas laisser
@@ -280,6 +366,27 @@ async function synchroniserBypassFirewall() {
         } else if (r && r.message !== dernierEtatBypass) {
             dernierEtatBypass = r.message;
             console.log("🔐 Bypass firewall:", r.message);
+        }
+        if (r && r.success) {
+            const bindings = await mk.synchroniserBindingsBypass(macs);
+            if (bindings?.message) console.log("   " + bindings.message);
+            // Ne retirer login-by=mac qu'APRÈS une sync bypass réussie : sinon
+            // les comptes privilégiés perdent leur dernier chemin d'accès.
+            if (!durcissementFait) {
+                const durci = await durcirAuthentificationHotspot();
+                if (durci?.success && !durci?.ignore) {
+                    durcissementFait = true;
+                    if (process.env.MIKROTIK_PURGE_MAC_COOKIES === "on" && !purgeFaite) {
+                        const purge = await mk.purgerSessionsMacCookie(macs);
+                        if (purge?.message) console.log("   " + purge.message);
+                        purgeFaite = true;
+                    }
+                } else if (durci?.code === "DURCISSEMENT_DESACTIVE") {
+                    // Rollback durable : on ne tente plus toutes les 60 s.
+                } else if (durci?.message) {
+                    console.warn("⚠️  Durcissement non appliqué:", durci.message);
+                }
+            }
         }
         return r;
     } catch (err) {
@@ -1273,6 +1380,7 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
     const resultats = [];
     const cumuls = new Map();
     const tempsCumules = new Map();
+    const quotaEpuiseParTicket = new Set();
     const appliquerCumul = (client, ticket) => {
         if (!ticket || !cumuls.has(ticket)) return false;
         client.ticket = ticket;
@@ -1289,8 +1397,11 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
             ]);
             for (const u of (users.data || [])) {
                 if (!u.name) continue;
-                cumuls.set(u.name, (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0));
+                const total = (parseInt(u["bytes-in"]) || 0) + (parseInt(u["bytes-out"]) || 0);
+                cumuls.set(u.name, total);
                 tempsCumules.set(u.name, uptimeToSecondes(u.uptime));
+                const limite = parseInt(u["limit-bytes-total"]) || 0;
+                if (limite > 0 && total >= limite) quotaEpuiseParTicket.add(u.name);
             }
             const vusLive = new Set();
             for (const c of (actifs.data || [])) {
@@ -1354,7 +1465,9 @@ app.get("/api/admin/clients", adminAuth, async (req, res) => {
             const live = resultats.find(x => x.ip === d.ip);
             live.forfait = d.forfait || live.forfait;
         } else {
-            appliquerCumul(d, ticketPourClient(d));
+            const ticket = ticketPourClient(d);
+            if (quotaEpuiseParTicket.has(ticket)) continue;
+            appliquerCumul(d, ticket);
             resultats.push(d);
         }
     }
@@ -2159,6 +2272,91 @@ app.get("/api/admin/mikrotik/profils", adminAuth, async (req, res) => {
     res.json({ ...result, profils: result.data || [] });
 });
 
+// Contrôle read-only avant durcissement / test des deux téléphones.
+app.get("/api/admin/mikrotik/preflight-repeteur", adminAuth, async (req, res) => {
+    const preflight = await verifierPreflightRepeteur();
+    let actifs = [];
+    try {
+        if (mk.MIKROTIK_ENABLED) {
+            const clients = await mk.listerClientsActifs();
+            actifs = (clients?.data || []).map(c => ({
+                user: c.user || null,
+                mac: c["mac-address"] || null,
+                ip: c.address || c.ip || null,
+                uptime: c.uptime || null,
+            }));
+        }
+    } catch (e) {
+        actifs = [{ erreur: e.message }];
+    }
+    res.status(preflight?.success ? 200 : 400).json({
+        success: Boolean(preflight?.success),
+        preflight,
+        observables: actifs,
+        procedure: "Test 2 téléphones : A (payant) reste connecté ; B derrière le même répéteur ne doit AUCUNEMENT hériter du cookie MAC de A. Capturer avant/après les compteurs firewall smd-bypass et les sessions actives : seul le couple IP+MAC de A doit être autorisé. Puis usurper l'IP de A depuis B (MAC différente) : le trafic doit rester bloqué. Toute réussite de B invalide le correctif.",
+    });
+});
+
+// Durcir l'auth hotspot (retrait de login-by=mac + MAC cookies) et,
+// optionnellement, purger les sessions déjà autorisées par MAC cookie.
+app.post("/api/admin/mikrotik/durcir-auth", adminAuth, async (req, res) => {
+    const durci = await durcirAuthentificationHotspot();
+    if (!durci?.success) return res.status(400).json(durci);
+    let purge = null;
+    if (req.body?.purger === true) {
+        purge = await mk.purgerSessionsMacCookie(await macrosPriviligieesActives());
+    }
+    await ajouterLog("mikrotik", `${durci.message}${purge ? ` — ${purge.message}` : ""}`);
+    res.json({ success: true, durci, purge });
+});
+
+// Rollback durable en une seule étape (retour à login-by=mac + MAC cookies).
+// Le drapeau est persisté en DB : ni la boucle de 60 s ni un redémarrage ne
+// réappliquent le durcissement tant qu'un admin ne le réactive pas.
+app.post("/api/admin/mikrotik/annuler-durcissement", adminAuth, async (req, res) => {
+    const annule = await mk.annulerDurcissementAuthentificationHotspot();
+    if (!annule?.success) return res.status(400).json(annule);
+    const retrait = await mk.retirerBypassFirewall();
+    const retraitOk = retrait?.success !== false;
+    await ecrireDurcissementDesactive(true);
+    durcissementFait = false;
+    purgeFaite = false;
+    nettoyageRollbackFait = retraitOk;
+    dernierEtatBypass = "";
+    await ajouterLog("mikrotik", `Rollback auth hotspot (durable): ${annule.message} | ${retrait?.message || "retrait bypass indisponible"}`);
+    if (!retraitOk) {
+        return res.status(400).json({
+            success: false,
+            annule,
+            retrait,
+            durable: true,
+            message: "Auth restaurée et drapeau de rollback persisté, mais le retrait firewall est incomplet — nouvelle tentative automatique au prochain cycle.",
+        });
+    }
+    res.json({ success: true, annule, retrait, durable: true });
+});
+
+app.post("/api/admin/mikrotik/reactiver-durcissement", adminAuth, async (req, res) => {
+    const macs = await macrosPriviligieesActives();
+    const sync = await mk.synchroniserAdresseBypass(macs);
+    if (!sync?.success) return res.status(400).json({ success: false, sync });
+    const bindings = await mk.synchroniserBindingsBypass(macs);
+    const preflight = await verifierPreflightRepeteur();
+    if (!preflight?.success) return res.status(400).json({ success: false, preflight });
+    await ecrireDurcissementDesactive(false);
+    nettoyageRollbackFait = false;
+    durcissementFait = false;
+    purgeFaite = false;
+    const durci = await durcirAuthentificationHotspot();
+    if (!durci?.success) {
+        await ecrireDurcissementDesactive(true);
+        return res.status(400).json({ success: false, durci });
+    }
+    durcissementFait = true;
+    await ajouterLog("mikrotik", `Durcissement réactivé: ${durci.message}${bindings?.message ? ` — ${bindings.message}` : ""}`);
+    res.json({ success: true, sync, bindings, durci });
+});
+
 // Lister les clients actifs sur Mikrotik
 app.get("/api/admin/mikrotik/clients", adminAuth, async (req, res) => {
     const result = await mk.listerClientsActifs();
@@ -2893,6 +3091,30 @@ async function reconcilierUtilisateursHotspot() {
     for (const t of rows) {
         try {
             const info = await mk.informationsUtilisateurHotspot(t.code);
+            if (info.quotaEpuise) {
+                // Quota volume atteint : RouterOS a déjà coupé la session, mais
+                // les lignes DB restaient "connecte" (verifierExpirations ne
+                // teste que la durée). Clôturer pour retirer le client de la
+                // liste des clients connectés.
+                try {
+                    const { rows: ouvertes } = await pool.query(
+                        "SELECT DISTINCT ip FROM connexions WHERE ticket = $1 AND fin IS NULL", [t.code]
+                    );
+                    if (ouvertes.length > 0) {
+                        await pool.query("UPDATE connexions SET fin = now() WHERE ticket = $1 AND fin IS NULL", [t.code]);
+                        for (const c of ouvertes) {
+                            if (c.ip) await pool.query(
+                                "UPDATE clients SET statut = 'deconnecte' WHERE ip = $1 AND statut = 'connecte'", [c.ip]
+                            );
+                        }
+                        await mk.deconnecterSessionParUtilisateur(t.code);
+                        await ajouterLog("connexion", `Connexion ${t.code} clôturée — quota de données atteint`);
+                    }
+                } catch (e) {
+                    console.error(`Sweeper quota ${t.code}:`, e.message);
+                }
+                continue;
+            }
             if (info.existe) continue;
             // Session fermée ou durée dépassée en DB → rien à réparer
             const dureeMs = dureeEnMs(t.duree);
@@ -2983,6 +3205,8 @@ app.use((err, req, res, next) => {
                 console.log("🔓 Bypass firewall (address-list smd-bypass) ACTIF — sync toutes les 60 s");
                 setTimeout(() => { synchroniserBypassFirewall(); }, 10000);
                 setInterval(() => { synchroniserBypassFirewall(); }, 60000);
+                // Le durcissement et la purge éventuelle sont déclenchés par
+                // synchroniserBypassFirewall() uniquement après une sync réussie.
             } else if (bypassMode === "off") {
                 console.log("↩️  Bypass firewall: MIKROTIK_BYPASS_MODE=off — retrait des règles au démarrage");
                 setTimeout(async () => {

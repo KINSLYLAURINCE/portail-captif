@@ -227,6 +227,7 @@ async function creerProfilHotspot(nom, debit, quota, appareilUnique = false) {
                 `=.id=${id}`,
                 `=rate-limit=${debitMK}/${debitMK}`,
                 `=shared-users=${sharedUsers}`,
+                "=add-mac-cookie=false",
             ]);
             return { success: true, message: `Profil "${nom}" mis à jour sur Mikrotik` };
         } else {
@@ -236,6 +237,7 @@ async function creerProfilHotspot(nom, debit, quota, appareilUnique = false) {
                 `=name=${nom}`,
                 `=rate-limit=${debitMK}/${debitMK}`,
                 `=shared-users=${sharedUsers}`,
+                "=add-mac-cookie=false",
             ]);
             return { success: true, message: `Profil "${nom}" créé sur Mikrotik` };
         }
@@ -592,6 +594,366 @@ async function activerLoginByMac() {
     }
 }
 
+// ─── Durcissement de l'authentification hotspot ────────────────────────────
+// Diagnostic 2026-11-24 : `login-by=mac` + `add-mac-cookie=true` autorisent
+// une identité L2 pendant 3 jours. Derrière un répéteur en NAT, tous les
+// téléphones partagent la MAC/IP du répéteur → un seul paiement suffit pour
+// tout le monde. Les comptes privilégiés ne dépendent plus de login-by=mac :
+// ils passent par la liste smd-bypass (cf. plus bas). MIKROTIK_MAC_LOGIN=on
+// conserve l'ancien comportement (rollback d'urgence).
+
+/**
+ * Retirer `mac` du login-by des profils serveur et désactiver les MAC cookies
+ * sur les profils utilisateur. Idempotent, appliqué profil par profil.
+ * @param {string[]} profilsAppareilUnique - profils dont le forfait est limité
+ *        à un seul appareil (shared-users=1 ; les autres passent en unlimited)
+ */
+async function durcirAuthentificationHotspot(profilsAppareilUnique = []) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    if (process.env.MIKROTIK_MAC_LOGIN === "on") {
+        return { success: true, ignore: true, code: "MAC_LOGIN_ROLLBACK_ENV", message: "Durcissement ignoré (MIKROTIK_MAC_LOGIN=on)", details: { serveurs: 0, utilisateurs: 0, erreurs: [] } };
+    }
+    try {
+        const uniques = new Set(
+            (profilsAppareilUnique || []).map(p => String(p).trim()).filter(Boolean)
+        );
+        let serveurs = 0, utilisateurs = 0;
+        const erreurs = [];
+
+        const profils = await mikrotikCommand(["/ip/hotspot/profile/print"]);
+        for (const p of profils.data || []) {
+            try {
+                const methods = String(p["login-by"] || "")
+                    .split(",").map(s => s.trim()).filter(Boolean)
+                    .filter(m => m !== "mac");
+                if (methods.length === 0) methods.push("http-chap", "http-pap");
+                if (methods.join(",") !== String(p["login-by"] || "")) {
+                    await mikrotikCommand([
+                        "/ip/hotspot/profile/set",
+                        `=.id=${p[".id"]}`,
+                        `=login-by=${methods.join(",")}`,
+                    ]);
+                    serveurs++;
+                }
+            } catch (e) {
+                erreurs.push(`profil serveur ${p.name}: ${e.message}`);
+            }
+        }
+
+        const profilsUser = await mikrotikCommand(["/ip/hotspot/user/profile/print"]);
+        for (const p of profilsUser.data || []) {
+            try {
+                const shared = uniques.has(String(p.name || "")) ? "1" : "unlimited";
+                const maj = [];
+                if (String(p["add-mac-cookie"] || "").toLowerCase() !== "false") {
+                    maj.push("=add-mac-cookie=false");
+                }
+                if (String(p["shared-users"] || "") !== shared) {
+                    maj.push(`=shared-users=${shared}`);
+                }
+                if (maj.length > 0) {
+                    await mikrotikCommand([
+                        "/ip/hotspot/user/profile/set", `=.id=${p[".id"]}`, ...maj,
+                    ]);
+                    utilisateurs++;
+                }
+            } catch (e) {
+                erreurs.push(`profil utilisateur ${p.name}: ${e.message}`);
+            }
+        }
+
+        let restauration = null;
+        if (erreurs.length > 0) {
+            restauration = await annulerDurcissementAuthentificationHotspot();
+        }
+        return {
+            success: erreurs.length === 0,
+            message: `Auth hotspot ${erreurs.length === 0 ? "durcie" : "partiellement durcie (ÉCHEC — rollback appliqué)"} : ${serveurs} profil(s) serveur sans login-by=mac, ${utilisateurs} profil(s) utilisateur sans MAC cookie${erreurs.length ? ` — ${erreurs.length} erreur(s): ${erreurs.join(" | ")}` : ""}${restauration ? ` — ${restauration.message}` : ""}`,
+            details: { serveurs, utilisateurs, erreurs, restauration },
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur durcissement auth hotspot: ${err.message}` };
+    }
+}
+
+/**
+ * Enregistrer toutes les MAC privilégiées actives comme ip-binding bypassed.
+ * Idempotent : indispensable au démarrage car seules certaines MAC étaient
+ * historiquement présentes dans RouterOS (3 entrées pour 5 comptes DB).
+ */
+async function synchroniserBindingsBypass(macsPrivilegiees = []) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        const voulues = new Set(
+            (macsPrivilegiees || []).map(m => normaliserMac(m)).filter(Boolean).map(m => m.toLowerCase())
+        );
+        const existing = await mikrotikCommand(["/ip/hotspot/ip-binding/print"]);
+        const parMac = new Map();
+        for (const b of existing.data || []) {
+            const macL = normaliserMac(b["mac-address"])?.toLowerCase();
+            if (macL) parMac.set(macL, b);
+        }
+        let ajouts = 0, corrections = 0;
+        for (const macL of voulues) {
+            const b = parMac.get(macL);
+            if (!b) {
+                await mikrotikCommand([
+                    "/ip/hotspot/ip-binding/add", `=mac-address=${macL.toUpperCase()}`, "=type=bypassed",
+                ]);
+                ajouts++;
+            } else if (String(b.type || "") !== "bypassed") {
+                await mikrotikCommand([
+                    "/ip/hotspot/ip-binding/set", `=.id=${b[".id"]}`, "=type=bypassed",
+                ]);
+                corrections++;
+            }
+        }
+        return {
+            success: true,
+            message: `Bindings bypass: ${voulues.size} MAC(s) voulue(s) — ${ajouts} ajout(s), ${corrections} correction(s)`,
+            details: { voulues: voulues.size, ajouts, corrections },
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur sync bindings bypass: ${err.message}` };
+    }
+}
+
+/**
+ * Contrôle de pré-vol (read-back) avant tout retrait de login-by=mac.
+ * Valide l'égalité attendu/observé et l'absence d'identité inconnue :
+ *   - chaque MAC privilégiée active est en ip-binding type=bypassed ;
+ *   - aucune MAC inconnue n'est bypassée ;
+ *   - chaque entrée smd-bypass porte un commentaire MAC attendu et une IP
+ *     confirmée par une entrée ARP statique (chokepoint anti-usurpation) ;
+ *   - les 3 règles firewall smd-bypass sont présentes avec action=return.
+ * @param {string[]} macsPrivilegiees - MACs actives issues de la DB (source de vérité)
+ */
+async function verifierPreflightRepeteur(macsPrivilegiees = []) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    const attendues = new Set(
+        (macsPrivilegiees || []).map(m => normaliserMac(m)?.toLowerCase()).filter(Boolean)
+    );
+    const problemes = [];
+    try {
+        const [bindings, liste, arp, nat, filtre] = await Promise.all([
+            mikrotikCommand(["/ip/hotspot/ip-binding/print"], 15000),
+            mikrotikCommand(["/ip/firewall/address-list/print", `?list=${BYPASS_LISTE}`], 15000),
+            mikrotikCommand(["/ip/arp/print"], 15000),
+            mikrotikCommand(["/ip/firewall/nat/print"], 15000),
+            mikrotikCommand(["/ip/firewall/filter/print"], 15000),
+        ]);
+
+        const bypassed = new Map();
+        for (const b of bindings.data || []) {
+            if (String(b.type || "") !== "bypassed") continue;
+            const mac = normaliserMac(b["mac-address"])?.toLowerCase();
+            if (!mac) continue;
+            if (bypassed.has(mac)) problemes.push(`MAC ${mac} dupliquée en ip-binding`);
+            bypassed.set(mac, b);
+        }
+        for (const mac of attendues) {
+            if (!bypassed.has(mac)) problemes.push(`MAC privilégiée absente de ip-binding: ${mac}`);
+        }
+        for (const mac of bypassed.keys()) {
+            if (!attendues.has(mac)) problemes.push(`ip-binding bypassé inconnu: ${mac}`);
+        }
+
+        const entrees = new Map();
+        for (const e of liste.data || []) {
+            const ip = e.address;
+            const mac = String(e.comment || "").trim().toLowerCase();
+            if (!ip || !mac) {
+                problemes.push(`Entrée smd-bypass invalide: ${ip || "IP manquante"} / ${mac || "MAC manquante"}`);
+                continue;
+            }
+            if (entrees.has(ip)) problemes.push(`IP ${ip} dupliquée dans smd-bypass`);
+            entrees.set(ip, mac);
+            if (!attendues.has(mac)) problemes.push(`Entrée smd-bypass inconnue: ${ip} (${mac})`);
+            if (!bypassed.has(mac)) problemes.push(`Entrée smd-bypass sans ip-binding: ${ip} (${mac})`);
+        }
+
+        const arpStatiques = new Map();
+        for (const a of arp.data || []) {
+            const dynamique = a.dynamic === "true" || a.dynamic === true;
+            if (dynamique) continue;
+            const mac = normaliserMac(a["mac-address"])?.toLowerCase();
+            if (!mac || !a.address) continue;
+            if (!arpStatiques.has(mac)) arpStatiques.set(mac, new Set());
+            arpStatiques.get(mac).add(a.address);
+        }
+        const durci = process.env.MIKROTIK_BYPASS_ANTISPOOF === "on";
+        for (const mac of attendues) {
+            const ipsArp = arpStatiques.get(mac);
+            if (!ipsArp || ipsArp.size === 0) {
+                problemes.push(`ARP statique absent pour ${mac} (anti-usurpation non prouvé)`);
+                continue;
+            }
+            const ipsListe = [...entrees].filter(([, m]) => m === mac).map(([ip]) => ip);
+            if (ipsListe.length === 0) {
+                problemes.push(`Aucune IP smd-bypass pour ${mac}`);
+            } else if (!durci && !ipsListe.some(ip => ipsArp.has(ip))) {
+                problemes.push(`IP smd-bypass de ${mac} sans ARP statique correspondant`);
+            } else if (durci && (ipsListe.length !== ipsArp.size || !ipsListe.every(ip => ipsArp.has(ip)))) {
+                problemes.push(`ARP statique de ${mac} non exactement concordant avec smd-bypass`);
+            }
+        }
+
+        const paires = new Set([...entrees].map(([ip, mac]) => `${mac}|${ip}`));
+        const reglesValides = new Set();
+        for (const [table, rules] of [
+            ["/ip/firewall/nat", nat.data || []],
+            ["/ip/firewall/filter", filtre.data || []],
+        ]) {
+            for (const r of rules) {
+                const comment = String(r.comment || "");
+                const desactivee = String(r.disabled || "false") === "true";
+                if (comment === BYPASS_TAG) {
+                    if (durci && !desactivee) problemes.push(`Règle générique IP-only encore active (${table})`);
+                    continue;
+                }
+                if (!comment.startsWith(`${BYPASS_TAG}|`)) continue;
+                const [, macBrut, ip] = comment.split("|");
+                const mac = String(macBrut || "").toLowerCase();
+                const paire = `${mac}|${ip}`;
+                if (!paires.has(paire)) {
+                    problemes.push(`Règle bypass pour une paire inconnue: ${comment}`);
+                    continue;
+                }
+                if (String(r.action || "") !== "return") problemes.push(`Règle bypass sans action=return: ${comment}`);
+                if (desactivee) problemes.push(`Règle bypass désactivée: ${comment}`);
+                const chaine = String(r.chain || "");
+                let champsAttendus = null;
+                if (table === "/ip/firewall/nat" && chaine === "hs-unauth") {
+                    champsAttendus = { "src-address": ip, "src-mac-address": normaliserMac(mac) };
+                } else if (table === "/ip/firewall/filter" && chaine === "hs-unauth") {
+                    champsAttendus = { "src-address": ip, "src-mac-address": normaliserMac(mac) };
+                } else if (table === "/ip/firewall/filter" && chaine === "hs-unauth-to") {
+                    champsAttendus = { "dst-address": ip };
+                } else {
+                    problemes.push(`Règle bypass sur chaîne inattendue: ${table} ${chaine}`);
+                    continue;
+                }
+                for (const [champ, valeur] of Object.entries(champsAttendus)) {
+                    if (String(r[champ] || "") !== String(valeur)) {
+                        problemes.push(`Règle ${comment}: ${champ}=${r[champ] || "?"} au lieu de ${valeur}`);
+                    }
+                }
+                reglesValides.add(`${paire}|${table}|${chaine}`);
+            }
+        }
+        if (durci) {
+            for (const paire of paires) {
+                for (const [table, chaine] of [
+                    ["/ip/firewall/nat", "hs-unauth"],
+                    ["/ip/firewall/filter", "hs-unauth"],
+                    ["/ip/firewall/filter", "hs-unauth-to"],
+                ]) {
+                    if (!reglesValides.has(`${paire}|${table}|${chaine}`)) {
+                        problemes.push(`Règle anti-usurpation manquante: ${paire} (${table} ${chaine})`);
+                    }
+                }
+            }
+        } else {
+            const reglesGeneriques = [...(nat.data || []), ...(filtre.data || [])].filter(
+                r => String(r.comment || "") === BYPASS_TAG
+                    && String(r.action || "") === "return"
+                    && String(r.disabled || "false") !== "true"
+            );
+            if (reglesGeneriques.length < 3) {
+                problemes.push(`Règles bypass firewall incomplètes (${reglesGeneriques.length}/3)`);
+            }
+        }
+
+        return {
+            success: problemes.length === 0,
+            message: problemes.length === 0
+                ? `Preflight OK : ${attendues.size} MAC(s) privilégiée(s), ARP exact, ${paires.size} couple(s) IP+MAC protégé(s), aucune règle IP-only active`
+                : `Preflight ÉCHOUÉ (${problemes.length} anomalie(s)) : ${problemes.join(" | ")}`,
+            details: {
+                attendues: attendues.size,
+                bindingsBypasses: bypassed.size,
+                entreesListe: entrees.size,
+                arpStatiques: arpStatiques.size,
+                couplesVerifies: durci ? paires.size : 0,
+                reglesValides: reglesValides.size,
+                problemes,
+            },
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur preflight répéteur: ${err.message}`, details: { problemes: [err.message] } };
+    }
+}
+
+/**
+ * Rollback d'urgence : rétablit login-by=mac et add-mac-cookie=true.
+ * Ne touche pas aux shared-users (valeur d'origine non conservée).
+ */
+async function annulerDurcissementAuthentificationHotspot() {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        let serveurs = 0, utilisateurs = 0;
+        const profils = await mikrotikCommand(["/ip/hotspot/profile/print"]);
+        for (const p of profils.data || []) {
+            const methodes = new Set(
+                String(p["login-by"] || "").split(",").map(s => s.trim()).filter(Boolean)
+            );
+            if (methodes.has("mac")) continue;
+            methodes.add("mac");
+            await mikrotikCommand([
+                "/ip/hotspot/profile/set", `=.id=${p[".id"]}`, `=login-by=${[...methodes].join(",")}`,
+            ]);
+            serveurs++;
+        }
+        const profilsUser = await mikrotikCommand(["/ip/hotspot/user/profile/print"]);
+        for (const p of profilsUser.data || []) {
+            if (String(p["add-mac-cookie"] || "").toLowerCase() === "true") continue;
+            await mikrotikCommand([
+                "/ip/hotspot/user/profile/set", `=.id=${p[".id"]}`, "=add-mac-cookie=true",
+            ]);
+            utilisateurs++;
+        }
+        return {
+            success: true,
+            message: `Auth hotspot restaurée : ${serveurs} profil(s) serveur avec login-by=mac, ${utilisateurs} profil(s) utilisateur avec MAC cookie`,
+            details: { serveurs, utilisateurs },
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur rollback auth hotspot: ${err.message}` };
+    }
+}
+
+/**
+ * Purger les sessions déjà autorisées par MAC cookie (login MAC, username = MAC).
+ * Sans cela, une session ouverte avant le durcissement reste valable jusqu'à
+ * son expiration. Les appareils privilégiés et les sessions avec un vrai code
+ * ticket sont préservés. Opération destructive : uniquement sur demande
+ * explicite (MIKROTIK_PURGE_MAC_COOKIES=on au démarrage).
+ */
+async function purgerSessionsMacCookie(macsPrivilegiees = []) {
+    if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
+    try {
+        const garder = new Set(
+            (macsPrivilegiees || []).map(m => normaliserMac(m)?.toLowerCase()).filter(Boolean)
+        );
+        const actifs = await mikrotikCommand(["/ip/hotspot/active/print"]);
+        let retirees = 0;
+        for (const a of actifs.data || []) {
+            const macL = normaliserMac(a["mac-address"])?.toLowerCase();
+            const userL = String(a.user || "").toLowerCase();
+            if (!macL || garder.has(macL) || userL !== macL) continue;
+            await mikrotikCommand(["/ip/hotspot/active/remove", `=.id=${a[".id"]}`]);
+            retirees++;
+        }
+        return {
+            success: true,
+            message: `Sessions MAC cookie purgées : ${retirees} session(s) déconnectée(s)`,
+            details: { retirees },
+        };
+    } catch (err) {
+        return { success: false, message: `Erreur purge MAC cookies: ${err.message}` };
+    }
+}
+
 /**
  * Ajouter une adresse MAC en bypass hotspot (accès sans portail captif)
  * Utilise /ip/hotspot/user avec le profil "bypass" ou crée un utilisateur sans limite
@@ -640,11 +1002,36 @@ async function ajouterMacBypass(mac, nom, debit) {
             await mikrotikCommand(words);
         }
 
-        // Point critique : sans "mac" dans le login-by du profil serveur
-        // hotspot, RouterOS affiche quand même la page de login.
-        await activerLoginByMac();
+        // Le compte privilégié ne doit PAS dépendre de login-by=mac (ce mode
+        // autorise aussi les répéteurs NAT). Il est enregistré comme entrée
+        // "bypassed" dans ip-binding, source de la sync address-list, et les
+        // règles firewall smd-bypass sont remises en place si besoin.
+        const binding = await mikrotikCommand(["/ip/hotspot/ip-binding/print", `?mac-address=${macMK}`]);
+        if (binding.data && binding.data.length > 0) {
+            await mikrotikCommand([
+                "/ip/hotspot/ip-binding/set",
+                `=.id=${binding.data[0][".id"]}`,
+                "=type=bypassed",
+                `=mac-address=${macMK}`,
+            ]);
+        } else {
+            await mikrotikCommand([
+                "/ip/hotspot/ip-binding/add",
+                `=mac-address=${macMK}`,
+                "=type=bypassed",
+            ]);
+        }
+        // En mode anti-usurpation les règles IP+MAC dépendent des couples IP
+        // calculés ci-dessous : elles sont créées par synchroniserAdresseBypass().
+        if (process.env.MIKROTIK_BYPASS_ANTISPOOF !== "on") await initierBypassFirewall();
+        if (process.env.MIKROTIK_MAC_LOGIN === "on") await activerLoginByMac();
 
-        return { success: true, message: `Bypass MAC "${mac}" activé sur Mikrotik pour "${nom}" — accès sans portail captif (login-by=mac vérifié)` };
+        return {
+            success: true,
+            message: process.env.MIKROTIK_MAC_LOGIN === "on"
+                ? `Bypass MAC "${mac}" activé sur Mikrotik pour "${nom}" — login-by=mac restauré (rollback MIKROTIK_MAC_LOGIN=on)`
+                : `Bypass MAC "${mac}" activé sur Mikrotik pour "${nom}" — ip-binding + firewall smd-bypass (aucun login-by=mac)`,
+        };
     } catch (err) {
         return { success: false, message: `Erreur Mikrotik bypass: ${err.message}` };
     }
@@ -664,12 +1051,25 @@ async function supprimerMacBypass(mac) {
             `?mac-address=${macMK}`
         ]);
 
+        let retire = 0;
         if (existing.data && existing.data.length > 0) {
-            const id = existing.data[0][".id"];
-            await mikrotikCommand(["/ip/hotspot/user/remove", `=.id=${id}`]);
-            return { success: true, message: `Bypass MAC "${mac}" supprimé sur Mikrotik — portail captif rétabli` };
+            for (const u of existing.data) {
+                await mikrotikCommand(["/ip/hotspot/user/remove", `=.id=${u[".id"]}`]);
+                retire++;
+            }
         }
-        return { success: true, message: `Bypass MAC "${mac}" inexistant sur Mikrotik (déjà supprimé)` };
+        const binding = await mikrotikCommand(["/ip/hotspot/ip-binding/print", `?mac-address=${macMK}`]);
+        for (const b of binding.data || []) {
+            if (String(b.type || "") !== "bypassed") continue;
+            await mikrotikCommand(["/ip/hotspot/ip-binding/remove", `=.id=${b[".id"]}`]);
+            retire++;
+        }
+        return {
+            success: true,
+            message: retire > 0
+                ? `Bypass MAC "${mac}" supprimé sur Mikrotik (${retire} entrée(s)) — portail captif rétabli`
+                : `Bypass MAC "${mac}" inexistant sur Mikrotik (déjà supprimé)`,
+        };
     } catch (err) {
         return { success: false, message: `Erreur Mikrotik suppression bypass: ${err.message}` };
     }
@@ -687,6 +1087,8 @@ async function supprimerMacBypass(mac) {
 //      (stoppe les reject tcp-reset / icmp-host-prohibited sortants)
 //   3) /ip firewall filter chain=hs-unauth-to  dst-address-list=smd-bypass → return
 //      (stoppe les reject des retours internet → client)
+// Depuis le council 2026-11-25 (verdict D), MIKROTIK_BYPASS_ANTISPOOF=on remplace
+// ces 3 règles génériques par une règle PAR COUPLE IP+MAC avec src-mac-address.
 // Les règles ne matchent QUE les membres de la liste : les flux gratuits/payants
 // ne traversent aucune règle modifiée. Rollback : MIKROTIK_BYPASS_MODE=off +
 // restart → retirerBypassFirewall(). Limite connue : le trafic bypassé n'a pas
@@ -697,39 +1099,93 @@ const BYPASS_LISTE = "smd-bypass";
 const BYPASS_TAG = "smd-bypass";
 
 /**
- * Crée (idempotent) les 3 règles de bypass en tête des chaînes hotspot.
+ * Crée les règles de bypass en tête des chaînes hotspot.
+ * Mode historique (MIKROTIK_BYPASS_ANTISPOOF!=on) : 3 règles génériques
+ *   src/dst-address-list=smd-bypass.
+ * Mode durci (MIKROTIK_BYPASS_ANTISPOOF=on) : une règle PAR COUPLE IP/MAC
+ *   avec `src-mac-address`, et désactivation des règles génériques IP-only.
+ *   C'est le seul moyen d'empêcher un usurpateur d'IP de bénéficier du bypass.
+ * @param {{ip:string, mac:string}[]} paires - couples IP/MAC privilégiés validés
  */
-async function initierBypassFirewall() {
+async function initierBypassFirewall(paires = []) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     const defs = [
         { table: "/ip/firewall/nat",    chain: "hs-unauth",    champ: "src-address-list" },
         { table: "/ip/firewall/filter", chain: "hs-unauth",    champ: "src-address-list" },
         { table: "/ip/firewall/filter", chain: "hs-unauth-to", champ: "dst-address-list" },
     ];
+    const durci = process.env.MIKROTIK_BYPASS_ANTISPOOF === "on";
     try {
-        let creees = 0;
+        if (!durci) {
+            let creees = 0;
+            for (const d of defs) {
+                const rules = await mikrotikCommand([d.table + "/print"]);
+                const deja = (rules.data || []).some(
+                    r => r.chain === d.chain && String(r.comment || "") === BYPASS_TAG
+                );
+                if (deja) continue;
+                const premier = (rules.data || []).find(r => r.chain === d.chain);
+                const mots = [
+                    d.table + "/add", `=chain=${d.chain}`, "=action=return",
+                    `=${d.champ}=${BYPASS_LISTE}`, `=comment=${BYPASS_TAG}`,
+                ];
+                if (premier) mots.push(`=place-before=${premier[".id"]}`);
+                await mikrotikCommand(mots);
+                creees++;
+            }
+            return {
+                success: true,
+                message: creees > 0 ? `${creees} règle(s) bypass firewall créée(s)` : "Règles bypass firewall déjà en place",
+            };
+        }
+
+        const pairesValides = (paires || []).filter(p => p && p.ip && p.mac);
+        const commentairesAttendus = new Set(
+            pairesValides.map(p => `${BYPASS_TAG}|${String(p.mac).toLowerCase()}|${p.ip}`)
+        );
+        let creees = 0, generiquesDesactivees = 0, obsoletesSupprimees = 0;
         for (const d of defs) {
             const rules = await mikrotikCommand([d.table + "/print"]);
-            const deja = (rules.data || []).some(
-                r => r.chain === d.chain && String(r.comment || "") === BYPASS_TAG
-            );
-            if (deja) continue;
-            // En tête de la chaîne (première règle réellement évaluée)
-            const premier = (rules.data || []).find(r => r.chain === d.chain);
-            const mots = [
-                d.table + "/add",
-                `=chain=${d.chain}`,
-                "=action=return",
-                `=${d.champ}=${BYPASS_LISTE}`,
-                `=comment=${BYPASS_TAG}`,
-            ];
-            if (premier) mots.push(`=place-before=${premier[".id"]}`);
-            await mikrotikCommand(mots);
-            creees++;
+            for (const r of rules.data || []) {
+                const comment = String(r.comment || "");
+                if (comment === BYPASS_TAG) {
+                    if (String(r.disabled || "false") === "true") continue;
+                    await mikrotikCommand([d.table + "/set", `=.id=${r[".id"]}`, "=disabled=yes"]);
+                    generiquesDesactivees++;
+                    continue;
+                }
+                if (comment.startsWith(`${BYPASS_TAG}|`) && !commentairesAttendus.has(comment)) {
+                    await mikrotikCommand([d.table + "/remove", `=.id=${r[".id"]}`]);
+                    obsoletesSupprimees++;
+                }
+            }
+            for (const paire of pairesValides) {
+                const comment = `${BYPASS_TAG}|${paire.mac}|${paire.ip}`;
+                const deja = (rules.data || []).some(
+                    r => r.chain === d.chain && String(r.comment || "") === comment
+                );
+                if (deja) continue;
+                const premier = (rules.data || []).find(
+                    r => r.chain === d.chain
+                        && String(r.disabled || "false") !== "true"
+                        && !(String(r.comment || "").startsWith(`${BYPASS_TAG}|`)
+                            && !commentairesAttendus.has(String(r.comment || "")))
+                );
+                const mots = [d.table + "/add", `=chain=${d.chain}`, "=action=return", `=comment=${comment}`];
+                if (d.champ === "src-address-list") {
+                    mots.push(`=src-address=${paire.ip}`, `=src-mac-address=${paire.mac.toUpperCase()}`);
+                } else {
+                    mots.push(`=dst-address=${paire.ip}`);
+                }
+                if (premier) mots.push(`=place-before=${premier[".id"]}`);
+                await mikrotikCommand(mots);
+                creees++;
+            }
         }
         return {
             success: true,
-            message: creees > 0 ? `${creees} règle(s) bypass firewall créée(s)` : "Règles bypass firewall déjà en place",
+            message: `Bypass anti-usurpation : ${creees} règle(s) IP+MAC créée(s), ${generiquesDesactivees} règle(s) générique(s) désactivée(s), ${obsoletesSupprimees} règle(s) obsolète(s) retirée(s)${pairesValides.length === 0 ? " — aucune IP privilégiée: aucun bypass IP-only créé" : ""}`,
+            details: { creees, generiquesDesactivees, obsoletesSupprimees, paires: pairesValides.length },
         };
     } catch (err) {
         return { success: false, message: `Erreur init bypass firewall: ${err.message}` };
@@ -757,7 +1213,10 @@ function ipDansReseau(ip, cidr) {
  *      cycle de sync) ;
  *   3. table ARP : couvre les appareils en IP FIXE configurée sur l'appareil
  *      (TV, PC, box…) qui ne demandent jamais de bail — sans cette source ils
- *      restent éternellement hors de la liste et n'ont pas Internet.
+ *      restent éternellement hors de liste et n'ont pas Internet ;
+ * Le ip-binding "bypassed" n'est PAS une source d'identité : c'est une cible
+ * de vérification (voir verifierPreflightRepeteur). Le accepter ici ferait
+ * d'une entrée obsolète/usurpée un accès permanent.
  *
  * Seules les IP appartenant à un réseau connecté du routeur sont retenues :
  * une IP hors plan d'adressage (ex: 192.168.0.x sans interface) ne peut pas
@@ -770,8 +1229,6 @@ function ipDansReseau(ip, cidr) {
 async function synchroniserAdresseBypass(macs) {
     if (!MIKROTIK_ENABLED) return { success: false, message: "Mikrotik désactivé" };
     try {
-        await initierBypassFirewall();
-
         const macsVoulues = new Set(
             (macs || []).map(m => normaliserMac(m)).filter(Boolean).map(m => m.toLowerCase())
         );
@@ -779,10 +1236,11 @@ async function synchroniserAdresseBypass(macs) {
         // Timeout élargi : ces impressions sont volumineuses (ARP + baux) et un
         // timeout de 5 s provoquait des "Timeout connexion Mikrotik" en rafale,
         // laissant la liste dans un état incohérent.
-        const [leases, arp, adresses] = await Promise.all([
+        const [leases, arp, adresses, bindings] = await Promise.all([
             mikrotikCommand(["/ip/dhcp-server/lease/print"], 15000),
             mikrotikCommand(["/ip/arp/print"], 15000),
             mikrotikCommand(["/ip/address/print"], 15000),
+            mikrotikCommand(["/ip/hotspot/ip-binding/print"], 15000),
         ]);
 
         const reseaux = (adresses.data || [])
@@ -790,10 +1248,30 @@ async function synchroniserAdresseBypass(macs) {
             .map(a => a.address)
             .filter(Boolean);
 
+        // 0) Les ip-binding bypassed ne sont PAS une source d'identité : ils
+        //    sont vérifiés par verifierPreflightRepeteur(). Les accepter ici
+        //    transformerait une entrée obsolète/usurpée en accès permanent.
+        void bindings;
+
+        const durci = process.env.MIKROTIK_BYPASS_ANTISPOOF === "on";
+        const arpStatiques = new Map();
+        for (const a of arp.data || []) {
+            if (a.dynamic === "true" || a.dynamic === true) continue;
+            if (a.invalid === "true" || a.invalid === true) continue;
+            const macL = normaliserMac(a["mac-address"])?.toLowerCase();
+            if (!macL || !a.address) continue;
+            if (!arpStatiques.has(macL)) arpStatiques.set(macL, new Set());
+            arpStatiques.get(macL).add(a.address);
+        }
+
         const voulues = new Map(); // ip -> { mac, source }
         const ajouter = (ip, macL, source) => {
             if (!ip || ip === "0.0.0.0") return;
             if (!reseaux.some(c => ipDansReseau(ip, c))) return;
+            // En mode anti-usurpation, une IP sans ARP STATIQUE concordant ne
+            // doit jamais devenir une règle de bypass (un bail bound ou une
+            // ARP dynamique sont spoofables).
+            if (durci && !arpStatiques.get(macL)?.has(ip)) return;
             // Une même IP ne peut appartenir qu'à un seul appareil : on garde
             // la source la plus fiable déjà rencontrée (bail avant ARP).
             if (!voulues.has(ip)) voulues.set(ip, { mac: macL, source });
@@ -813,6 +1291,7 @@ async function synchroniserAdresseBypass(macs) {
             if (!macL || !a.address || !macsVoulues.has(macL.toLowerCase())) continue;
             if (a.complete === "false" || a.complete === false) continue;
             if (a.invalid === "true" || a.invalid === true) continue;
+            if (durci && (a.dynamic === "true" || a.dynamic === true)) continue;
             ajouter(a.address, macL.toLowerCase(), "arp");
         }
 
@@ -845,12 +1324,15 @@ async function synchroniserAdresseBypass(macs) {
             }
         }
 
+        const paires = [...voulues].map(([ip, ent]) => ({ ip, mac: ent.mac }));
+        const regles = await initierBypassFirewall(paires);
+
         const viaBail = [...voulues.values()].filter(v => v.source === "bail").length;
         const viaArp = voulues.size - viaBail;
         return {
-            success: true,
-            message: `Bypass firewall: ${voulues.size} IP privilégiée(s) (${viaBail} bail, ${viaArp} ARP/IP fixe) — ${ajouts} ajout(s), ${retraits} retrait(s), ${corrections} correction(s)`,
-            details: { dansListe: voulues.size, viaBail, viaArp, ajouts, retraits, corrections },
+            success: Boolean(regles?.success),
+            message: `Bypass firewall: ${voulues.size} IP privilégiée(s) (${viaBail} bail, ${viaArp} ARP/IP fixe) — ${ajouts} ajout(s), ${retraits} retrait(s), ${corrections} correction(s). ${regles.message}`,
+            details: { dansListe: voulues.size, viaBail, viaArp, ajouts, retraits, corrections, regles: regles.details || null },
         };
     } catch (err) {
         return { success: false, message: `Erreur sync bypass firewall: ${err.message}` };
@@ -868,7 +1350,8 @@ async function retirerBypassFirewall() {
         for (const table of ["/ip/firewall/nat", "/ip/firewall/filter"]) {
             const rules = await mikrotikCommand([table + "/print"]);
             for (const r of rules.data || []) {
-                if (String(r.comment || "") === BYPASS_TAG) {
+                const comment = String(r.comment || "");
+                if (comment === BYPASS_TAG || comment.startsWith(`${BYPASS_TAG}|`)) {
                     await mikrotikCommand([table + "/remove", `=.id=${r[".id"]}`]);
                     n++;
                 }
@@ -879,7 +1362,13 @@ async function retirerBypassFirewall() {
             await mikrotikCommand(["/ip/firewall/address-list/remove", `=.id=${e[".id"]}`]);
             n++;
         }
-        return { success: true, message: `Bypass firewall retiré (${n} élément(s))` };
+        const bindings = await mikrotikCommand(["/ip/hotspot/ip-binding/print"]);
+        for (const b of bindings.data || []) {
+            if (String(b.type || "") !== "bypassed") continue;
+            await mikrotikCommand(["/ip/hotspot/ip-binding/remove", `=.id=${b[".id"]}`]);
+            n++;
+        }
+        return { success: true, message: `Bypass firewall et ip-binding retirés (${n} élément(s))` };
     } catch (err) {
         return { success: false, message: `Erreur retrait bypass firewall: ${err.message}` };
     }
@@ -1036,7 +1525,7 @@ async function creerHotspot(opts) {
         // 5. Profil serveur hotspot (créé seulement si l'admin n'en choisit pas un existant)
         //    Note : ce RouterOS n'accepte pas le paramètre `comment` sur le profil.
         if (!opts.profilServer) {
-            await mikrotikCommand(["/ip/hotspot/profile/add", `=name=${profilNom}`, `=hotspot-address=${reseau.gateway}`, `=login-by=cookie,mac,http-chap,http-pap`, `=open-status-page=http-login`, `=html-directory=hotspot`]);
+            await mikrotikCommand(["/ip/hotspot/profile/add", `=name=${profilNom}`, `=hotspot-address=${reseau.gateway}`, `=login-by=cookie,http-chap,http-pap`, `=open-status-page=http-login`, `=html-directory=hotspot`]);
         }
         // 6. Serveur hotspot (pas de `comment` supporté non plus)
         await mikrotikCommand(["/ip/hotspot/add", `=name=${nom}`, `=interface=${iface}`, `=address-pool=${poolNom}`, `=profile=${profilNom}`, `=disabled=no`]);
@@ -1139,6 +1628,11 @@ module.exports = {
     listerHotspots,
     ajouterMacBypass,
     supprimerMacBypass,
+    durcirAuthentificationHotspot,
+    annulerDurcissementAuthentificationHotspot,
+    synchroniserBindingsBypass,
+    verifierPreflightRepeteur,
+    purgerSessionsMacCookie,
     initierBypassFirewall,
     synchroniserAdresseBypass,
     retirerBypassFirewall,
